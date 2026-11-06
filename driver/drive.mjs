@@ -98,9 +98,16 @@ function snapshotScript(rate) {
         v.muted = true;
         v.playbackRate = ${rate};
         const p = v.play();
-        if (p && p.catch) p.catch(() => {});
+        if (p && p.catch) p.catch((err) => { out.playErr = String((err && err.name) || err); });
         out.acted.push('play');
-      } catch (e) {}
+      } catch (e) {
+        out.playErr = String((e && e.message) || e);
+      }
+      // 从未开始播放时，点一次播放器的大播放按钮（不碰播放/暂停切换键，避免反向操作）
+      if (v.currentTime < 2) {
+        const big = document.querySelector('.vjs-big-play-button, .prism-big-play-btn, .xgplayer-start, [class*="big-play"], [class*="poster-play"]');
+        if (big) { try { big.click(); out.acted.push('click-big-play'); } catch (e) {} }
+      }
     } else if (Math.abs(v.playbackRate - ${rate}) > 0.01) {
       try { v.playbackRate = ${rate}; } catch (e) {}
     }
@@ -152,6 +159,7 @@ function log(msg) {
 let browserProc = null;
 let lastScanAt = 0;
 let pageTargetId = '';
+let lastRefreshAt = 0;
 let hubProc = null;
 
 async function ensureHub() {
@@ -224,6 +232,12 @@ async function ensurePage() {
 
 async function tick() {
   await ensurePage();
+
+  // 每 6 秒刷新一次上下文与会话（播放器 iframe 重建后旧句柄会失效）
+  if (Date.now() - lastRefreshAt > 6000) {
+    lastRefreshAt = Date.now();
+    try { await page.watchContexts(60); } catch (e) {}
+  }
   const script = snapshotScript(RATE);
   let frames = await evalAllFrames(script);
   if (!frames.length) {
@@ -241,6 +255,7 @@ async function tick() {
       paused: vidEntry.v.paused, ended: vidEntry.v.ended, rate: vidEntry.v.rate,
     });
     snap.acted = [...(topEntry.v.acted || []), ...(vidEntry.v.acted || [])];
+    if (vidEntry.v.playErr) snap.playErr = vidEntry.v.playErr;
     if (!snap.chapter) snap.chapter = '';
   } else {
     snap.hasVideo = false;
@@ -292,7 +307,7 @@ async function tick() {
   if (now - lastLog > 8000) {
     lastLog = now;
     const prog = snap.hasVideo
-      ? `${fmt(snap.cur)}/${fmt(snap.dur)} ${snap.paused ? '暂停' : '播放中'}`
+      ? `${fmt(snap.cur)}/${fmt(snap.dur)} ${snap.paused ? '暂停' : '播放中'}${snap.playErr ? ' playErr=' + snap.playErr : ''}`
       : `无视频（上下文 ${page.contexts.size} + 跨域 ${page.sessions.size}，共探测 ${frames.length}）`;
     log(`${(snap.chapter || '?').slice(0, 22)} | ${prog}${snap.acted?.length ? ' | ' + snap.acted.join(',') : ''}`);
   }

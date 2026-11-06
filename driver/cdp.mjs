@@ -77,6 +77,9 @@ export class Page {
     // flatten=true 让 OOPIF 以 sessionId 形式挂到当前连接上
     await this.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
     await this.send('Target.setDiscoverTargets', { discover: true }).catch(() => {});
+    // 关键：让页面始终认为自己在前台，对抗"失焦自动暂停"
+    await this.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+    await this.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
     await new Promise((r) => setTimeout(r, waitMs));
     return this.contexts.size + this.sessions.size;
   }
