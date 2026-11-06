@@ -100,7 +100,9 @@ export async function attach(startUrl, port = DEFAULT_PORT) {
   }
   if (!Array.isArray(pages)) throw new Error('CDP 返回异常：' + JSON.stringify(pages).slice(0, 200));
 
-  const hit = pages.find((p) => p.type === 'page' && /chaoxing\.com/.test(p.url || ''));
+  // 优先连课程播放页，其次才是任意 chaoxing 页面
+  const hit = pages.find((p) => p.type === 'page' && /studentstudy/.test(p.url || ''))
+    || pages.find((p) => p.type === 'page' && /chaoxing\.com/.test(p.url || ''));
   if (hit) return Page.connect(hit.webSocketDebuggerUrl);
 
   if (!startUrl) throw new Error('没有已打开的 chaoxing 页面，且未提供 startUrl');

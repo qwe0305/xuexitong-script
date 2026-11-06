@@ -9,7 +9,7 @@
  * 依赖：仅 Node 22+（内置 fetch / WebSocket）。需要浏览器以 --remote-debugging-port 启动，
  *       可用 driver/launch.mjs 一键拉起。
  */
-import { attach, listPages } from './cdp.mjs';
+import { attach, listPages, Page } from './cdp.mjs';
 import { launchBrowser, isCdpUp } from './browser.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -149,6 +149,8 @@ function log(msg) {
 /* ---------------- 主循环 ---------------- */
 
 let browserProc = null;
+let lastScanAt = 0;
+let pageTargetId = '';
 let hubProc = null;
 
 async function ensureHub() {
@@ -168,6 +170,27 @@ async function ensureBrowser() {
   log('浏览器已就绪');
 }
 
+/** 新标签页里打开了课程时，把驱动切过去 */
+async function switchToCourseTab() {
+  if (Date.now() - lastScanAt < 3000) return false;
+  lastScanAt = Date.now();
+  try {
+    const pages = await listPages(PORT);
+    if (!Array.isArray(pages)) return false;
+    const hit = pages.find((p) => p.type === 'page' && /studentstudy/.test(p.url || ''));
+    if (!hit || hit.id === pageTargetId) return false;
+    log('发现播放页标签页，切过去：' + String(hit.url || '').slice(0, 80));
+    try { page && page.close(); } catch (e) {}
+    page = await Page.connect(hit.webSocketDebuggerUrl);
+    pageTargetId = hit.id;
+    log('已重新连接');
+    return true;
+  } catch (e) {
+    log('切换标签页失败：' + (e.message || e));
+    return false;
+  }
+}
+
 async function ensurePage() {
   if (page) return page;
   page = await attach(START_URL || PORTAL, PORT);
@@ -177,8 +200,15 @@ async function ensurePage() {
 
 async function tick() {
   await ensurePage();
-  const snap = await page.eval(snapshotScript(RATE));
+  let snap = await page.eval(snapshotScript(RATE));
   const now = Date.now();
+
+  // 当前标签页不是播放页时，扫一遍所有标签页，可能课程开在新标签
+  if (!/studentstudy/.test(String(snap.url || ''))) {
+    if (await switchToCourseTab()) {
+      snap = await page.eval(snapshotScript(RATE));
+    }
+  }
 
   // 自动模式：还没进播放页就只等待，并给出当前页面该点什么的提示
   const curUrl = String(snap.url || '');
