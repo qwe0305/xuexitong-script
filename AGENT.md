@@ -97,13 +97,17 @@ start.cmd
 - 想看状态：`python agent/agent.py status`
 - 想让它自己判断并补动作：`python agent/agent.py watch`
 
-### 6. 可选：开启 AI 答题
+### 6. 可选：开启 AI 答题（默认关闭）
+
+> **答题默认是关的**。用户当前的要求是"先取消答题，优先刷课"，所以不要主动去配 key 或加 `--quiz`，除非用户明确要开。
 
 复制 `agent/config.example.json` 为 `agent/config.json`，填 `llm.key`（DeepSeek、通义、智谱、Kimi、本地 Ollama 都支持，OpenAI 格式）。
 
-验证：`curl http://127.0.0.1:8731/ai-status` 返回 `{"ready":true}`。
+验证：`npm run ai-check`（真发一道题，能直接看出 key 错、余额不足、base 写错），或 `curl http://127.0.0.1:8731/ai-status` 返回 `{"ready":true}`。
 
-⚠️ 默认 `autoSubmitQuiz = false`，只帮你勾选答案、不自动交卷。要改在 `localStorage['xxt_quiz_config']` 或改 `extension/quiz.js` 里的默认值。
+开启方式：`node driver/drive.mjs --quiz`（方案 B 用 `driver/quiz.mjs`，不依赖扩展）；要自动交卷再加 `--auto-submit`。
+
+⚠️ 默认不自动提交，只帮你勾选答案。方案 A 的开关在 `localStorage['xxt_quiz_config']`。
 
 ---
 
@@ -116,6 +120,8 @@ start.cmd
 | 一直「等待进入课程页」 | 用户还没点进课程 | 提示用户点一下；确认登录成功 |
 | 视频一播就暂停 | ① 倍速不是 1.0（已被锁死，除非用户改了 config）② 平台识别无头浏览器 | 让用户改用 `start.cmd`（有窗口）并最小化；确认 `localStorage['xxt_config']` 里 `playbackRate` 是 1 |
 | 一直不切下一节 | 目录树的当前小节类名是 `posCatalog_active`（不是 `active`），且跳转绑在内层 `span.posCatalog_name` 的 onclick | 用 `node tests/switch-test.mjs` 复测；正常应输出「✅ 章节确实切换了」和变化后的 chapterId |
+| 页面变成 `chrome-error://chromewebdata/` | 网络抖动或 reload 失败 | 已内置自动回跳（回最后一次正常的课程地址，连失败 3 次退回门户）。日志里会打印「页面异常…自动导航回」 |
+| 驱动莫名消失、日志停在某个时间点 | 进程崩了或跑满 `--max-hours` | 已提供守护 VBS（见 README「常驻与单实例」），退出 60 秒后自动拉起；`data/supervisor.log` 有重启记录 |
 | 进度原地不动 | 要么倍速非 1.0，要么 seek 被拦截后停在原位 | 用 `node tests/rate-125.mjs` 复测；把倍速改回 1.0 并重新 play() |
 | `连不上 CDP` | 浏览器被关掉 | 重新运行 start.cmd |
 | 卡在测验页不动 | 平台结构变化 | 让用户手动过；把页面截图给 Agent 调选择器 |

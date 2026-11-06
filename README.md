@@ -104,7 +104,9 @@ node agent/server.mjs
 
 看到 `[xxt-agent] listening http://127.0.0.1:8731` 即成功。默认数据落在 `data/`（可用环境变量 `XXT_DATA` 改）。
 
-### 3. 配置 AI 答题（可选，不配也能刷课）
+### 3. 配置 AI 答题（可选，默认关闭）
+
+> **刷课优先**：答题能力默认关闭，只有启动时加 `--quiz` 才会生效。只想刷课的话这一节可以直接跳过。
 
 复制 `agent/config.example.json` 为 `agent/config.json`，填入你的大模型 key：
 
@@ -121,7 +123,10 @@ node agent/server.mjs
 兼容任何 OpenAI 格式接口：通义、智谱、Kimi、本地 Ollama（`http://127.0.0.1:11434/v1`）都可。
 也可用环境变量：`XXT_LLM_BASE` / `XXT_LLM_KEY` / `XXT_LLM_MODEL`。
 
-验证：`curl http://127.0.0.1:8731/ai-status` → `{"ready":true}`
+验证：`npm run ai-check`（会真的发一道题过去，直接告诉你 key 通不通、错在哪），或 `curl http://127.0.0.1:8731/ai-status` → `{"ready":true}`
+
+**方案 B（无插件驱动）现在也能答题**：`driver/quiz.mjs` 是驱动侧实现的，不依赖浏览器扩展。开启方式 `node driver/drive.mjs --quiz`，要连提交一起自动做再加 `--auto-submit`。
+离线验证答题链路（不需要 key）：`npm run test:quiz`，它会在本地起一个假题目页 + 假大模型，断言"单选勾 B、多选勾 AC"。
 
 ---
 
@@ -155,17 +160,27 @@ node driver/drive.mjs --url "<课程播放页URL>"
 
 #### 常驻与单实例
 
-- 驱动带**单实例锁**（`data/drive.pid`）：重复启动会自动检测到已在运行的实例并直接退出，避免"开机自启 + 手动双击"两个驱动互抢播放器。
-- 开机自启：把下面这段存成 `.vbs` 放进 `shell:startup`（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`），登录后自动隐藏启动。
+- 驱动带**单实例锁**（`data/drive.pid`）：重复启动会自动检测到已在运行的实例并直接退出，避免"开机自启 + 手动双击"两个驱动互抢播放器。**注意不要手动删这个 pid 文件再启动**，否则锁会失效。
+- **崩溃自愈**：把下面这段存成 `.vbs` 放进 `shell:startup`（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`）。它是一个守护循环，驱动退出（崩溃或跑满 `--max-hours`）后 60 秒自动重新拉起。
 
   ```vbs
+  Dim sh, fso, f
   Set sh = CreateObject("WScript.Shell")
+  Set fso = CreateObject("Scripting.FileSystemObject")
   sh.CurrentDirectory = "D:\WorkBuddy\chaoxing-agent"
-  sh.Run "cmd /c node driver\drive.mjs --interval 3 >> data\drive.out.log 2>&1", 0, False
+  On Error Resume Next
+  Do
+    sh.Run "cmd /c node driver\drive.mjs --interval 3 >> data\drive.out.log 2>&1", 0, True
+    Set f = fso.OpenTextFile("data\supervisor.log", 8, True)
+    f.WriteLine Now & "  driver exited, restart in 60s"
+    f.Close
+    WScript.Sleep 60000
+  Loop
   ```
 
-  删除该 `.vbs` 即取消自启。
-- 日志在 `data/drive.out.log`，实时状态走本机中枢：`curl http://127.0.0.1:8731/status`。
+  删除该 `.vbs` 即取消自启与自愈。
+- 日志：`data/drive.out.log`（驱动），`data/supervisor.log`（守护重启记录）。
+- 实时状态：`curl http://127.0.0.1:8731/status`。
 
 常用参数：
 
@@ -174,6 +189,8 @@ node driver/drive.mjs --url "<课程播放页URL>"
 | `--windowed` | 关 | 改为有窗口运行（headless 被平台识别时用，可最小化） |
 | `--rate` | **1.0（已锁死）** | 无效参数。传非 1.0 只会打印警告并被忽略，原因见下节「倍速与跳播的实测结论」 |
 | `--interval` | 3 | 轮询间隔（秒） |
+| `--quiz` | **关** | 开启 AI 答题（默认关闭，刷课稳定性优先） |
+| `--auto-submit` | 关 | 答完自动交卷。默认只勾选不提交，留给你核对 |
 | `--skip-after` | 60 | 无视频多少秒后跳过该节 |
 | `--max-hours` | 10 | 最长运行时长 |
 | `--port` | 9222 | CDP 端口 |
@@ -236,6 +253,7 @@ extension/         浏览器扩展（方案 A，直接加载这个目录）
 driver/            纯后台驱动（方案 B，不用插件）
   launch.mjs       拉起带调试端口的浏览器（登录用）
   drive.mjs        主循环：取快照 → 决策 → 点播放/切节
+  quiz.mjs         驱动版 AI 答题（默认关闭，加 --quiz 开启）
   cdp.mjs          极简 CDP 客户端（零依赖，用 Node 内置 WebSocket）
   browser.mjs      浏览器启动参数与端口探测
 agent/             本机中枢与 Agent
@@ -251,6 +269,9 @@ tests/             可复现的验证脚本（都可直接 node 跑）
   catalog-dom.mjs    打印单个目录节点的完整结构与 onclick
   switch-test.mjs    点下一节 → 点回来，验证切节是否真的生效
   end-test.mjs       播完自动切节的端到端观察
+  recover.mjs        把跑到错误页的标签页导航回课程地址
+  quiz-mock.mjs      答题链路离线集成测试（本地假页面 + 假大模型，不需要 key）
+  ai-check.mjs       大模型 key 连通性自检
   frame-probe.mjs    跨域 iframe（OOPIF）穿透合成测试
   diag-live.mjs      只读诊断：每个 frame 的视频状态
 docs/

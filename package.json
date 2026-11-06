@@ -11,7 +11,10 @@
     "headless": "node driver/drive.mjs",
     "login": "node driver/launch.mjs",
     "hub": "node agent/server.mjs",
-    "drive": "node driver/drive.mjs"
+    "drive": "node driver/drive.mjs",
+    "quiz": "node driver/drive.mjs --quiz",
+    "ai-check": "node tests/ai-check.mjs",
+    "test:quiz": "node tests/quiz-mock.mjs"
   },
   "license": "MIT"
 }

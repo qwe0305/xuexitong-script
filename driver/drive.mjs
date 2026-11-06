@@ -11,6 +11,8 @@
  */
 import { attach, listPages, Page } from './cdp.mjs';
 import { launchBrowser, isCdpUp } from './browser.mjs';
+import { askLLM, llmReady } from '../agent/ai.mjs';
+import { collect as quizCollect, solvePage as quizSolve, submit as quizSubmit } from './quiz.mjs';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -45,6 +47,9 @@ const MAX_HOURS = Number(arg('max-hours', '10'));
 const NO_VIDEO_SKIP_MS = Number(arg('skip-after', '60')) * 1000;
 const PORT = Number(arg('port', process.env.XXT_CDP_PORT || '9222'));
 const HEADLESS = !flag('windowed');   // 默认无窗口，加 --windowed 才显示
+// AI 答题：默认关闭（先用 --quiz 显式开启）。刷课稳定性优先，答题按需再开。
+const NO_QUIZ = !flag('quiz');
+const AUTO_SUBMIT = flag('auto-submit'); // 答完自动交卷（默认不交，留给你核对）
 
 const T0 = Date.now();
 let page = null;
@@ -56,6 +61,13 @@ let lastCur = -1;          // 上次进度，用于停滞检测
 let stallSince = 0;        // 从什么时候开始不动
 let lastReloadAt = 0;      // 上次强制刷新时间
 let nearEndStreak = 0;     // 连续几轮判定为「临近结尾」
+let lastGoodUrl = '';      // 最后一次正常可用的课程页地址（掉线后回跳用）
+let lastNavAt = 0;         // 上次自动导航时间
+let stallKicked = false;   // 本轮停滞是否已轻推过
+let navFails = 0;          // 连续自动导航失败次数
+let lastQuizSig = '';      // 上次答过的题目签名，避免同一页反复作答
+let lastQuizAt = 0;
+let switchAttempts = 0;    // 连续切节失败次数（≥2 改用按钮兜底）
 
 /* ---------------- 页面内执行的快照+操作脚本 ---------------- */
 
@@ -130,7 +142,7 @@ function snapshotScript(rate) {
 })()`;
 }
 
-function nextScript() {
+function nextScript(preferButton = false) {
   return `(() => {
   // 实测（tests/catalog-probe.mjs）：超星用 class="posCatalog_select posCatalog_active" 标记当前小节，
   // 不是 \`active\`。之前的 findIndex 恒为 -1，导致目录树切节一直没生效。
@@ -141,22 +153,34 @@ function nextScript() {
     const p = n.parentElement;
     return !!(p && /(^|\\s)active(\\s|$)|posCatalog_active/.test(String(p.className || '')));
   };
-  const nodes = Array.from(document.querySelectorAll('.posCatalog_select:not(.firstLayer)'));
-  if (nodes.length) {
-    let idx = nodes.findIndex(isActive);
-    if (idx >= 0 && idx + 1 < nodes.length) {
-      const target = nodes[idx + 1];
-      // 真正的跳转绑在 span.posCatalog_name 的 onclick="getTeacherAjax(courseId,clazzid,chapterId)"
-      const nameEl = target.querySelector('.posCatalog_name') || target;
-      const label = (nameEl.title || nameEl.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
-      try { nameEl.click(); } catch (e) {}
-      return { ok: true, how: 'tree', from: idx, to: label };
-    }
-    if (idx === nodes.length - 1) return { ok: false, why: '已是最后一节' };
+  const clickTree = () => {
+    const nodes = Array.from(document.querySelectorAll('.posCatalog_select:not(.firstLayer)'));
+    if (!nodes.length) return { ok: false, why: '没找到目录树' };
+    const idx = nodes.findIndex(isActive);
+    if (idx < 0) return { ok: false, why: '目录树里没有 active 标记' };
+    if (idx + 1 >= nodes.length) return { ok: false, why: '已是最后一节' };
+    const target = nodes[idx + 1];
+    // 真正的跳转绑在 span.posCatalog_name 的 onclick="getTeacherAjax(courseId,clazzid,chapterId)"
+    const nameEl = target.querySelector('.posCatalog_name') || target;
+    const label = (nameEl.title || nameEl.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+    try { nameEl.click(); } catch (e) {}
+    return { ok: true, how: 'tree', from: idx, to: label };
+  };
+  const clickButton = () => {
+    const next = document.querySelector('#prevNextFocusNext, .prev_next, #right1');
+    if (!next) return { ok: false, why: '没找到下一节按钮' };
+    try { next.click(); } catch (e) {}
+    return { ok: true, how: 'button' };
+  };
+  if (${preferButton ? 'true' : 'false'}) {
+    const b = clickButton();
+    if (b.ok) return b;
+    return clickTree();
   }
-  const next = document.querySelector('#prevNextFocusNext, .prev_next, #right1');
-  if (next) { try { next.click(); } catch (e) {} return { ok: true, how: 'button' }; }
-  return { ok: false, why: '没找到目录树或下一节按钮' };
+  const t = clickTree();
+  if (t.ok) return t;
+  const b = clickButton();
+  return b.ok ? b : t;
 })()`;
 }
 
@@ -270,7 +294,7 @@ async function tick() {
   const vidEntry = frames.find((f) => f.v.hasVideo) || null;
   const topCtxId = topEntry.ctxId;
 
-  const snap = Object.assign({}, topEntry.v);
+  let snap = Object.assign({}, topEntry.v);
   if (vidEntry) {
     Object.assign(snap, {
       hasVideo: true,
@@ -295,6 +319,8 @@ async function tick() {
   // 当前标签页不是播放页时，扫一遍所有标签页，可能课程开在新标签
   if (!/studentstudy/.test(String(snap.url || ''))) {
     if (await switchToCourseTab()) {
+      // 注意：这里曾经写成 const snap，切换标签页时会抛
+      // "Assignment to constant variable."，导致整轮异常、断连、再也恢复不了
       snap = await page.eval(snapshotScript(RATE));
     }
   }
@@ -302,6 +328,20 @@ async function tick() {
   // 自动模式：还没进播放页就只等待，并给出当前页面该点什么的提示
   const curUrl = String(snap.url || '');
   if (!/studentstudy/.test(curUrl)) {
+    /* 页面掉到错误页/空白页时（网络抖动、reload 失败等），之前这里只会无限等待。
+       实测 17:33 一次网络抖动后页面变成 chrome-error://chromewebdata/，
+       驱动就此卡死 25 分钟。现在改成自动导航回最后一次正常的课程地址。 */
+    const broken = !curUrl || curUrl === 'about:blank' || /^chrome-error:/.test(curUrl);
+    if (broken && now - lastNavAt > 30000) {
+      navFails++;
+      // 回跳两三次还进不去（enc 过期等），就退到门户页重新走
+      const target = navFails >= 3 ? PORTAL : (lastGoodUrl || PORTAL);
+      lastNavAt = now;
+      log(`页面异常（${curUrl || '空白'}），自动导航回：${target.slice(0, 80)}${navFails >= 3 ? '（已失败 ' + navFails + ' 次，退回门户）' : ''}`);
+      try { await page.send('Page.navigate', { url: target }); } catch (e) {}
+      await sleep(8000);
+      return;
+    }
     const hint = pageHint(curUrl);
     if (hint !== lastHint || now - lastLog > 15000) {
       lastLog = now;
@@ -311,6 +351,8 @@ async function tick() {
     }
     return;
   }
+  lastGoodUrl = curUrl;   // 记下能正常用的课程地址，供掉线后回跳
+  navFails = 0;
 
   const hb = {
     ts: new Date().toISOString(),
@@ -334,26 +376,54 @@ async function tick() {
   if (snap.hasVideo) noVideoSince = 0;
   else if (!noVideoSince) noVideoSince = now;
 
-  /* 停滞检测：进度长时间不前进（暂停被反复压制 / 播放器假死）时，主动刷新一次页面 */
+  /* 停滞检测：进度长时间不前进（播放器假死 / 缓冲卡住）时分两级处理，
+     先轻推（原地微调 currentTime 重新触发解码），推不动再整页重载。
+     之前一上来就 reload，撞上网络抖动会直接掉进 chrome-error 页。 */
   if (snap.hasVideo && !snap.ended) {
     if (lastCur >= 0 && Math.abs((snap.cur ?? 0) - lastCur) < 0.5) {
       if (!stallSince) stallSince = now;
     } else {
       stallSince = 0;
+      stallKicked = false;
     }
     lastCur = snap.cur ?? -1;
-    if (stallSince && now - stallSince > 90000 && now - lastReloadAt > 300000) {
-      const stuckSec = Math.round((now - stallSince) / 1000);
+    const stuckMs = stallSince ? now - stallSince : 0;
+
+    if (stuckMs > 45000 && !stallKicked) {
+      stallKicked = true;
+      log('进度停滞 45s，先轻推一次（微调播放位置 + 重新 play）');
+      const kick = `(() => {
+        const v = document.querySelector('video');
+        if (!v) return 'no-video';
+        try { v.playbackRate = 1; v.muted = true; v.currentTime = Math.max(0, v.currentTime + 0.3); } catch (e) {}
+        const p = v.play(); if (p && p.catch) p.catch(() => {});
+        return { cur: +v.currentTime.toFixed(1), paused: v.paused };
+      })()`;
+      try {
+        if (vidEntry && vidEntry.sessionId) await page.evalInSession(vidEntry.sessionId, kick);
+        else if (vidEntry && vidEntry.ctxId != null) await page.evalIn(vidEntry.ctxId, kick);
+        else await page.eval(kick);
+      } catch (e) {}
+      return;
+    }
+
+    if (stuckMs > 120000 && now - lastReloadAt > 300000) {
+      log(`进度停滞 ${Math.round(stuckMs / 1000)}s，轻推无效，整页重载`);
       lastReloadAt = now;
       stallSince = 0;
+      stallKicked = false;
       lastCur = -1;
-      log(`进度停滞 ${stuckSec}s，强制刷新页面恢复`);
-      try { await page.eval('location.reload()'); } catch (e) {}
-      await sleep(6000);
+      // 不用 location.reload()（失败会留下错误页），改用 CDP 导航到已知可用地址
+      try {
+        if (lastGoodUrl) await page.send('Page.navigate', { url: lastGoodUrl });
+        else await page.eval('location.reload()');
+      } catch (e) {}
+      await sleep(8000);
       return;
     }
   } else {
     stallSince = 0;
+    stallKicked = false;
     lastCur = -1;
   }
 
@@ -363,6 +433,37 @@ async function tick() {
       ? `${fmt(snap.cur)}/${fmt(snap.dur)} ${snap.paused ? '暂停' : '播放中'}${snap.playErr ? ' playErr=' + snap.playErr : ''}`
       : `无视频（上下文 ${page.contexts.size} + 跨域 ${page.sessions.size}，共探测 ${frames.length}）`;
     log(`${(snap.chapter || '?').slice(0, 22)} | ${prog}${snap.acted?.length ? ' | ' + snap.acted.join(',') : ''}`);
+  }
+
+  /* ---- 无视频但页面上有题目 → 走 AI 答题 ---- */
+  if (!snap.hasVideo && !NO_QUIZ && now - lastQuizAt > 20000) {
+    const qs = await quizCollect(page, topCtxId).catch(() => null);
+    if (qs && qs.length) {
+      const sig = (curUrl + '#' + qs.map((q) => q.question).join('|')).slice(0, 800);
+      if (sig !== lastQuizSig) {
+        lastQuizSig = sig;
+        lastQuizAt = now;
+        noVideoSince = 0;   // 答题期间别触发"无视频跳过"
+        if (!llmReady()) {
+          log(`检测到测验页（${qs.length} 题），但大模型 key 未配置，跳过。配置方法：agent/config.json 填 llm.key`);
+        } else {
+          log(`检测到测验页，共 ${qs.length} 题，开始 AI 答题`);
+          const res = await quizSolve(page, topCtxId, qs, askLLM, log, {});
+          const ok = res.filter((r) => r.ok).length;
+          const skipped = res.filter((r) => r.skipped).length;
+          log(`答题结束：成功 ${ok} 题，跳过 ${skipped} 题，失败 ${res.length - ok - skipped} 题`);
+          if (AUTO_SUBMIT) {
+            const s = await quizSubmit(page, topCtxId);
+            log(s ? `已自动提交（点了「${s}」）` : '没找到提交按钮，未提交');
+            await sleep(4000);
+          } else {
+            log('未自动提交（默认只勾选）。确认无误后自己点提交，或加 --auto-submit 参数');
+          }
+        }
+        await sleep(3000);
+        return;
+      }
+    }
   }
 
   // 决策：切下一节
@@ -380,9 +481,13 @@ async function tick() {
   if (endedLongEnough || noVideoTooLong) {
     if (now - lastNextAt < 12000) return;
     const reason = snap.ended ? '视频播完' : nearEnd ? '到达结尾' : `无视频 ${Math.round((now - noVideoSince) / 1000)}s`;
+
+    // 目录节点点过一次不一定真跳成功，连续两次没换章节就改走「下一节按钮」
+    const preferButton = switchAttempts >= 2;
     let r;
     try {
-      r = topCtxId != null ? await page.evalIn(topCtxId, nextScript()) : await page.eval(nextScript());
+      const script = nextScript(preferButton);
+      r = topCtxId != null ? await page.evalIn(topCtxId, script) : await page.eval(script);
     } catch (e) {
       r = { ok: false, why: e.message };
     }
@@ -391,9 +496,37 @@ async function tick() {
     nearEndStreak = 0;
     lastCur = -1;
     stallSince = 0;
-    log(`切换下一节（${reason}）→ ${r.ok ? (r.to || r.how || 'ok') : '失败：' + r.why}`);
-    if (r.ok) await sleep(3000);   // 等新页面加载
+    stallKicked = false;
+
+    const from = snap.chapter || '';
+    log(`切换下一节（${reason}）→ ${r.ok ? (r.to || r.how || 'ok') : '失败：' + r.why}${preferButton ? ' [按钮兜底]' : ''}`);
+    if (r.ok) {
+      await sleep(3500);   // 等新页面加载
+      // 回读章节名，确认是否真的换了
+      let ch2 = '';
+      try {
+        const s2 = topCtxId != null ? await page.evalIn(topCtxId, chapterScript()) : await page.eval(chapterScript());
+        ch2 = (s2 && s2.chapter) || '';
+      } catch (e) {}
+      if (ch2 && from && ch2 === from) {
+        switchAttempts++;
+        log(`小节没换（仍是「${from.slice(0, 20)}」），下次改用按钮兜底重试（第 ${switchAttempts} 次）`);
+      } else {
+        switchAttempts = 0;
+        log(`已切到「${ch2.slice(0, 24) || '新小节'}」`);
+      }
+    } else {
+      switchAttempts++;
+    }
   }
+}
+
+/** 只回读当前小节名（切节后校验用） */
+function chapterScript() {
+  return `(() => {
+  const act = document.querySelector('.posCatalog_select.posCatalog_active, .posCatalog_active, .posCatalog_select.active');
+  return { chapter: act ? (act.title || act.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60) : '' };
+})()`;
 }
 
 function pageHint(url) {
