@@ -37,6 +37,8 @@ export class Page {
     this.ws = ws;
     this.id = 0;
     this.pending = new Map();
+    this.contexts = new Map();      // contextId -> { id, origin, name, auxData }
+    this.sessions = new Map();      // sessionId -> { targetId, url, type } 跨域 iframe（OOPIF）
     ws.addEventListener('message', (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
@@ -45,8 +47,69 @@ export class Page {
         this.pending.delete(msg.id);
         if (msg.error) reject(new Error(msg.error.message || JSON.stringify(msg.error)));
         else resolve(msg.result);
+        return;
+      }
+      // 事件：维护 frame 执行上下文列表（跨域 iframe 也能取到）
+      if (msg.method === 'Runtime.executionContextCreated') {
+        const c = msg.params.context;
+        this.contexts.set(c.id, c);
+      } else if (msg.method === 'Runtime.executionContextDestroyed') {
+        this.contexts.delete(msg.params.executionContextId);
+      } else if (msg.method === 'Runtime.executionContextsCleared') {
+        this.contexts.clear();
+      } else if (msg.method === 'Target.attachedToTarget') {
+        const { sessionId, targetInfo } = msg.params;
+        this.sessions.set(sessionId, {
+          targetId: targetInfo.targetId,
+          url: targetInfo.url,
+          type: targetInfo.type,
+        });
+      } else if (msg.method === 'Target.detachedFromTarget') {
+        this.sessions.delete(msg.params.sessionId);
       }
     });
+  }
+
+  /** 打开 Runtime 并挂载跨域 iframe（OOPIF），等事件到达 */
+  async watchContexts(waitMs = 500) {
+    await this.send('Runtime.enable').catch(() => {});
+    await this.send('Page.enable').catch(() => {});
+    // flatten=true 让 OOPIF 以 sessionId 形式挂到当前连接上
+    await this.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+    await this.send('Target.setDiscoverTargets', { discover: true }).catch(() => {});
+    await new Promise((r) => setTimeout(r, waitMs));
+    return this.contexts.size + this.sessions.size;
+  }
+
+  /** 在跨域 iframe 会话里执行 */
+  async evalInSession(sessionId, expression) {
+    const r = await this.send('Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+      userGesture: true,
+    }, sessionId);
+    if (r.exceptionDetails) {
+      const d = r.exceptionDetails;
+      throw new Error(d.exception?.description || d.text || '会话执行异常');
+    }
+    return r.result?.value;
+  }
+
+  /** 在指定 context 里执行 */
+  async evalIn(contextId, expression) {
+    const r = await this.send('Runtime.evaluate', {
+      expression,
+      contextId,
+      returnByValue: true,
+      awaitPromise: true,
+      userGesture: true,
+    });
+    if (r.exceptionDetails) {
+      const d = r.exceptionDetails;
+      throw new Error(d.exception?.description || d.text || '上下文执行异常');
+    }
+    return r.result?.value;
   }
 
   static async connect(wsUrl) {
@@ -58,11 +121,13 @@ export class Page {
     return new Page(ws);
   }
 
-  send(method, params = {}) {
+  send(method, params = {}, sessionId) {
     const id = ++this.id;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify({ id, method, params }));
+      const msg = { id, method, params };
+      if (sessionId) msg.sessionId = sessionId;
+      this.ws.send(JSON.stringify(msg));
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
@@ -103,7 +168,11 @@ export async function attach(startUrl, port = DEFAULT_PORT) {
   // 优先连课程播放页，其次才是任意 chaoxing 页面
   const hit = pages.find((p) => p.type === 'page' && /studentstudy/.test(p.url || ''))
     || pages.find((p) => p.type === 'page' && /chaoxing\.com/.test(p.url || ''));
-  if (hit) return Page.connect(hit.webSocketDebuggerUrl);
+  if (hit) {
+    const p = await Page.connect(hit.webSocketDebuggerUrl);
+    await p.watchContexts();
+    return p;
+  }
 
   if (!startUrl) throw new Error('没有已打开的 chaoxing 页面，且未提供 startUrl');
 
@@ -111,5 +180,6 @@ export async function attach(startUrl, port = DEFAULT_PORT) {
   if (!created || !created.webSocketDebuggerUrl) throw new Error('新建标签页失败，请手动在浏览器里打开发课程页');
   const page = await Page.connect(created.webSocketDebuggerUrl);
   await page.send('Page.enable').catch(() => {});
+  await page.watchContexts();
   return page;
 }

@@ -51,6 +51,7 @@ let lastHint = '';
 function snapshotScript(rate) {
   return `(() => {
   const out = { acted: [], hasVideo: false };
+  try { out.isTop = window === window.top; } catch (e) { out.isTop = false; }
   const visible = (el) => {
     if (!el) return false;
     const r = el.getBoundingClientRect();
@@ -191,6 +192,29 @@ async function switchToCourseTab() {
   }
 }
 
+/** 在所有 frame 的执行上下文里跑同一段脚本（跨域 iframe 也能取到） */
+async function evalAllFrames(expr) {
+  const out = [];
+
+  // a) 同源 frame：按执行上下文执行
+  for (const ctxId of Array.from(page.contexts.keys()).slice(0, 12)) {
+    try {
+      const v = await page.evalIn(ctxId, expr);
+      if (v && typeof v === 'object') out.push({ ctxId, v });
+    } catch (e) {}
+  }
+
+  // b) 跨域 iframe（OOPIF）：按 session 执行
+  for (const sessionId of Array.from(page.sessions.keys()).slice(0, 12)) {
+    try {
+      const v = await page.evalInSession(sessionId, expr);
+      if (v && typeof v === 'object') { v.viaOopif = true; out.push({ ctxId: null, sessionId, v }); }
+    } catch (e) {}
+  }
+
+  return out;
+}
+
 async function ensurePage() {
   if (page) return page;
   page = await attach(START_URL || PORTAL, PORT);
@@ -200,7 +224,27 @@ async function ensurePage() {
 
 async function tick() {
   await ensurePage();
-  let snap = await page.eval(snapshotScript(RATE));
+  const script = snapshotScript(RATE);
+  let frames = await evalAllFrames(script);
+  if (!frames.length) {
+    try { const v = await page.eval(script); if (v) frames = [{ ctxId: null, v }]; } catch (e) {}
+  }
+  const topEntry = frames.find((f) => f.v.isTop) || frames[0] || { ctxId: null, v: {} };
+  const vidEntry = frames.find((f) => f.v.hasVideo) || null;
+  const topCtxId = topEntry.ctxId;
+
+  const snap = Object.assign({}, topEntry.v);
+  if (vidEntry) {
+    Object.assign(snap, {
+      hasVideo: true,
+      cur: vidEntry.v.cur, dur: vidEntry.v.dur,
+      paused: vidEntry.v.paused, ended: vidEntry.v.ended, rate: vidEntry.v.rate,
+    });
+    snap.acted = [...(topEntry.v.acted || []), ...(vidEntry.v.acted || [])];
+    if (!snap.chapter) snap.chapter = '';
+  } else {
+    snap.hasVideo = false;
+  }
   const now = Date.now();
 
   // 当前标签页不是播放页时，扫一遍所有标签页，可能课程开在新标签
@@ -247,7 +291,9 @@ async function tick() {
 
   if (now - lastLog > 8000) {
     lastLog = now;
-    const prog = snap.hasVideo ? `${fmt(snap.cur)}/${fmt(snap.dur)} ${snap.paused ? '暂停' : '播放中'}` : '无视频';
+    const prog = snap.hasVideo
+      ? `${fmt(snap.cur)}/${fmt(snap.dur)} ${snap.paused ? '暂停' : '播放中'}`
+      : `无视频（上下文 ${page.contexts.size} + 跨域 ${page.sessions.size}，共探测 ${frames.length}）`;
     log(`${(snap.chapter || '?').slice(0, 22)} | ${prog}${snap.acted?.length ? ' | ' + snap.acted.join(',') : ''}`);
   }
 
@@ -258,7 +304,12 @@ async function tick() {
   if (endedLongEnough || noVideoTooLong) {
     if (now - lastNextAt < 12000) return;
     const reason = endedLongEnough ? '视频播完' : `无视频 ${Math.round((now - noVideoSince) / 1000)}s`;
-    const r = await page.eval(nextScript());
+    let r;
+    try {
+      r = topCtxId != null ? await page.evalIn(topCtxId, nextScript()) : await page.eval(nextScript());
+    } catch (e) {
+      r = { ok: false, why: e.message };
+    }
     lastNextAt = now;
     noVideoSince = 0;
     log(`切换下一节（${reason}）→ ${r.ok ? (r.to || r.how || 'ok') : '失败：' + r.why}`);
