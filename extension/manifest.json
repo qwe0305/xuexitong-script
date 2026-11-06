@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "超星学习通 · Agent 代刷",
+  "version": "1.1.0",
+  "description": "学习通刷课脚本：自动播放、自动切节、自动关弹窗、AI 答题，并支持本机 Agent 双向控制",
+  "background": {
+    "service_worker": "bg.js"
+  },
+  "host_permissions": [
+    "http://127.0.0.1:8731/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://mooc1.chaoxing.com/mycourse/studentstudy*",
+        "*://*.chaoxing.com/mycourse/studentstudy*",
+        "*://*.chaoxing.com/mooc2-ans/mycourse/studentstudy*"
+      ],
+      "js": [
+        "core.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.chaoxing.com/*"
+      ],
+      "js": [
+        "assist.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "*://*.chaoxing.com/*"
+      ],
+      "js": [
+        "quiz.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+data/
+agent/config.json
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
