@@ -86,6 +86,51 @@ node agent/server.mjs
 
 ---
 
+## 两种跑法：扩展 或 纯后台驱动（不用插件）
+
+| | 方案 A：浏览器扩展 | 方案 B：CDP 后台驱动 |
+| --- | --- | --- |
+| 需要装插件 | 是 | **否** |
+| 浏览器可见 | 需要在窗口里 | **可以完全无窗口（headless）** |
+| 原理 | 扩展注入页面脚本 | 通过调试协议从外部在页面执行 JS |
+| 用你现有登录态 | 是（Edge 默认配置） | 否，需在独立配置目录登录一次 |
+| 适合 | 边用电脑边刷 | 挂机、关机前挂着跑 |
+
+### 方案 B：纯后台，不装插件
+
+**第一次（只需一次，登录用）**
+
+```bash
+node driver/launch.mjs --url "https://mooc1.chaoxing.com/"
+```
+
+这会在**独立配置目录**（`~/WorkBuddy/chaoxing-profile`）打开一个全新浏览器，里面没有你的登录态。在这个窗口里正常登录学习通、进一次课程，然后关掉即可。登录状态会存在这个目录里。
+
+**之后（完全后台）**
+
+```bash
+node driver/drive.mjs --url "<课程播放页URL>"
+```
+
+默认 headless：不弹窗、不占任务栏，脚本在后台把视频播完、自动切下一节。也可以双击 `run.cmd "<课程页URL>"`。
+
+常用参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--windowed` | 关 | 改为有窗口运行（headless 被平台识别时用，可最小化） |
+| `--rate` | 1.5 | 倍速 |
+| `--interval` | 3 | 轮询间隔（秒） |
+| `--skip-after` | 60 | 无视频多少秒后跳过该节 |
+| `--max-hours` | 10 | 最长运行时长 |
+| `--port` | 9222 | CDP 端口 |
+
+它会自动：本机中枢没跑就先拉起 → 浏览器没开就带调试端口拉起 → 每 3 秒取一次页面快照（视频进度、小节名、待点弹窗）→ 需要时点播放 / 点弹窗 / 点下一节 → 状态照旧写入 `/hb`，所以 `agent.py status`、`agent.py watch` 都能继续用。
+
+**首次带窗口跑一遍更稳**：`node driver/drive.mjs --windowed --url "<URL>"`，确认它在动，之后再换 headless。
+
+---
+
 ## 使用
 
 打开课程播放页（URL 含 `/mycourse/studentstudy`），脚本自动接管，无需操作。
@@ -129,17 +174,23 @@ AI 答题相关（`localStorage['xxt_quiz_config']`）：
 ## 目录
 
 ```
-extension/         浏览器扩展（直接加载这个目录）
+extension/         浏览器扩展（方案 A，直接加载这个目录）
   manifest.json
   core.js          播放/切节/看门狗/指令监听（MAIN 世界）
   assist.js        弹窗处理 + 心跳上报 + 指令轮询
   quiz.js          AI 答题
   bg.js            Service Worker
+driver/            纯后台驱动（方案 B，不用插件）
+  launch.mjs       拉起带调试端口的浏览器（登录用）
+  drive.mjs        主循环：取快照 → 决策 → 点播放/切节
+  cdp.mjs          极简 CDP 客户端（零依赖，用 Node 内置 WebSocket）
+  browser.mjs      浏览器启动参数与端口探测
 agent/             本机中枢与 Agent
   server.mjs       状态接收 + 指令队列 + /ask 转发
   ai.mjs           大模型调用与答案归一化
   agent.py         命令行 + 自动决策器
   config.example.json
+run.cmd            双击即跑（方案 B）
 docs/
   upstream-v3_optimized.js.txt   上游原始脚本存档
 ```
@@ -148,11 +199,13 @@ docs/
 
 ## 已知限制
 
-- **不能关窗口、不能让电脑睡眠**，否则播放与心跳一起断。标签页切到后台、窗口最小化不影响。
+- **方案 B 需要单独登录一次**：CDP 调试端口在 Chrome/Edge 136+ 不允许使用默认配置目录，因此用独立 profile，登录态不与你日常浏览器共享。
+- **headless 被识别**：少数课程会检测无头浏览器特征（`navigator.webdriver` 等）。若视频播不动或立刻暂停，改用 `--windowed` 并把窗口最小化。
+- **扩展方案不能关窗口、不能让电脑睡眠**，否则播放与心跳一起断。标签页切后台、窗口最小化不影响。
 - 播放器若在**跨域 iframe** 内，主帧看不到 `<video>`；`assist.js` 已按帧注入兜底，但主帧的“切下一节”依赖课程目录树，仍需要主帧在线。
 - 测验页面结构在超星多套模板间差异很大，`quiz.js` 用多组选择器兜底，抓不到会在控制台明确打印原因，需要按实际 DOM 补选择器。
 - AI 答题的准确率取决于模型与题库覆盖度，**默认不自动提交**，请自行核对后再交卷。
-- 依赖页面自带的 jQuery；若页面未加载会从 `code.jquery.com` 拉取，校园网墙掉时需改为本地注入。
+- 扩展方案依赖页面自带的 jQuery；若页面未加载会从 `code.jquery.com` 拉取，校园网墙掉时需改为本地注入。
 
 ---
 
