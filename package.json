@@ -1,0 +1,17 @@
+{
+  "name": "xuexitong-script",
+  "version": "1.2.0",
+  "private": true,
+  "description": "学习通刷课脚本：CDP 后台驱动 + 浏览器扩展双方案，支持 AI 答题",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node driver/drive.mjs --windowed",
+    "headless": "node driver/drive.mjs",
+    "login": "node driver/launch.mjs",
+    "hub": "node agent/server.mjs",
+    "drive": "node driver/drive.mjs"
+  },
+  "license": "MIT"
+}

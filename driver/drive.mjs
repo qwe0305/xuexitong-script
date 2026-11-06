@@ -30,6 +30,8 @@ function flag(name) {
 }
 
 const START_URL = arg('url', '');
+const AUTO = !START_URL;   // 没给 URL = 自动模式：打开门户，等用户点进课程后接管
+const PORTAL = 'https://mooc1.chaoxing.com/';
 const RATE = Number(arg('rate', '1.5'));
 const INTERVAL = Number(arg('interval', '3')) * 1000;
 const MAX_HOURS = Number(arg('max-hours', '10'));
@@ -161,13 +163,13 @@ async function ensureHub() {
 async function ensureBrowser() {
   if (await isCdpUp(PORT)) return;
   log('CDP 未就绪，自动拉起浏览器' + (HEADLESS ? '（无窗口后台）' : '（有窗口）'));
-  browserProc = await launchBrowser({ port: PORT, headless: HEADLESS, url: START_URL || undefined, keepAlive: true });
+  browserProc = await launchBrowser({ port: PORT, headless: HEADLESS, url: START_URL || PORTAL, keepAlive: true });
   log('浏览器已就绪');
 }
 
 async function ensurePage() {
   if (page) return page;
-  page = await attach(START_URL, PORT);
+  page = await attach(START_URL || PORTAL, PORT);
   log('已连接页面');
   return page;
 }
@@ -176,6 +178,15 @@ async function tick() {
   await ensurePage();
   const snap = await page.eval(snapshotScript(RATE));
   const now = Date.now();
+
+  // 自动模式：还没进课程页就只等待，不误操作
+  if (!/\/mycourse\/studentstudy/.test(snap.url || '')) {
+    if (now - lastLog > 15000) {
+      lastLog = now;
+      log('等待进入课程页：请在弹出的窗口里点进课程（只需第一次），当前：' + String(snap.url || '').slice(0, 70));
+    }
+    return;
+  }
 
   const hb = {
     ts: new Date().toISOString(),
@@ -250,6 +261,7 @@ async function main() {
     process.exit(2);
   }
   if (START_URL) log('起始页面：' + START_URL.slice(0, 120));
+  else log('自动模式：会打开学习通门户，请你点进课程一次，之后自动接管');
 
   while (Date.now() - T0 < MAX_HOURS * 3600 * 1000) {
     try {

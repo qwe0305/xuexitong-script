@@ -7,6 +7,36 @@
 
 ---
 
+## 一键安装
+
+在 PowerShell 里粘贴这一行：
+
+```powershell
+irm https://raw.githubusercontent.com/qwe0305/xuexitong-script/main/install.ps1 | iex
+```
+
+它会自动检查 Node → 下载源码到 `%USERPROFILE%\WorkBuddy\xuexitong-script` → 启动。
+
+**分享给别人时，只需发一个网址**：
+
+```
+https://github.com/qwe0305/xuexitong-script
+```
+
+对方把网址丢给自己的 AI 助手，说"照这个装"，助手读 [`AGENT.md`](AGENT.md) 就能自己完成安装与验证。
+
+---
+
+## 手动三步（不想跑脚本时）
+
+1. 装 [Node.js 22+](https://nodejs.org/zh-cn/download)（一路下一步，装完重开终端）
+2. 双击 **`start.cmd`**
+3. 在弹出的浏览器里登录学习通、点进任意一门课程 —— 之后就交给它，窗口可以最小化
+
+想纯后台无窗口：先完成一次上面的登录，然后双击 **`start-headless.cmd`**。
+
+---
+
 ## 它和原脚本有什么不同
 
 | 能力 | 原版 userscript | 本项目 |
