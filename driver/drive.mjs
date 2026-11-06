@@ -73,6 +73,7 @@ let switchAttempts = 0;    // 连续切节失败次数（≥2 改用按钮兜底
 let playerWaitSince = 0;   // 播放器 iframe 已挂载但视频未就绪的起始时间
 let textSince = 0;         // 文字章节开始阅读的时间
 let lastWaitLog = 0;
+let lastNetCheckAt = 0;    // 上次网络探测时间
 
 /* ---------------- 页面内执行的快照+操作脚本 ---------------- */
 
@@ -286,6 +287,25 @@ async function ensurePage() {
   return page;
 }
 
+/**
+ * 探测外网是否可达。断网时不要盲目重载页面，否则白丢本地进度。
+ */
+async function netOk() {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    const r = await fetch('https://mooc1.chaoxing.com/favicon.ico', {
+      method: 'HEAD',
+      cache: 'no-store',
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    return r.status < 500;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function tick() {
   await ensurePage();
 
@@ -417,6 +437,21 @@ async function tick() {
     }
 
     if (stuckMs > 120000 && now - lastReloadAt > 300000) {
+      /* 网络断着的时候重载没有任何意义：页面加载不出来，还会把本地进度丢掉、
+         只能从服务器最后记录的位置重来（实测一次断网白丢 3.5 分钟）。
+         所以重载前先探一下网络，断了就等。 */
+      if (now - lastNetCheckAt > 25000) {
+        lastNetCheckAt = now;
+        const online = await netOk();
+        if (!online) {
+          log(`网络不通（已停滞 ${Math.round(stuckMs / 1000)}s），暂不重载，等网络恢复`);
+          return;
+        }
+        log('网络已恢复，执行重载');
+      } else {
+        return;   // 刚探过，等下一轮
+      }
+
       log(`进度停滞 ${Math.round(stuckMs / 1000)}s，轻推无效，整页重载`);
       lastReloadAt = now;
       stallSince = 0;
