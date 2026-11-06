@@ -41,14 +41,28 @@ $tmpRoot = Join-Path $env:TEMP ('xxt-' + [guid]::NewGuid().ToString('N').Substri
 $zip     = Join-Path $tmpRoot 'src.zip'
 New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 
-$url = "https://github.com/$repo/archive/refs/heads/$branch.zip"
-Info "下载源码：$url"
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 120
-} catch {
-    Fail "下载失败：$($_.Exception.Message)"
-    Warn "请检查网络，或改用 git clone https://github.com/$repo.git"
+$sources = @(
+    "https://codeload.github.com/$repo/zip/refs/heads/$branch",
+    "https://github.com/$repo/archive/refs/heads/$branch.zip",
+    "https://ghfast.top/https://github.com/$repo/archive/refs/heads/$branch.zip"
+)
+
+$downloaded = $false
+foreach ($src in $sources) {
+    Info "下载源码：$src"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $src -OutFile $zip -UseBasicParsing -TimeoutSec 120
+        if ((Get-Item $zip).Length -gt 10000) { $downloaded = $true; break }
+        Warn '文件过小，换下一个源'
+    } catch {
+        Warn "该源失败：$($_.Exception.Message)"
+    }
+}
+
+if (-not $downloaded) {
+    Fail '所有下载源都失败了。'
+    Warn "国内网络可改用 Gitee：git clone https://gitee.com/$repo.git"
     return
 }
 Ok ("下载完成（{0:N1} MB）" -f ((Get-Item $zip).Length / 1MB))

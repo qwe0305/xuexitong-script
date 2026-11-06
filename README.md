@@ -9,13 +9,17 @@
 
 ## 一键安装
 
-在 PowerShell 里粘贴这一行：
+在 PowerShell 里粘贴其中一行（国内网络推荐第一条）：
 
 ```powershell
+# 国内加速（jsDelivr CDN）
+irm https://cdn.jsdelivr.net/gh/qwe0305/xuexitong-script@main/install.ps1 | iex
+
+# 直连 GitHub
 irm https://raw.githubusercontent.com/qwe0305/xuexitong-script/main/install.ps1 | iex
 ```
 
-它会自动检查 Node → 下载源码到 `%USERPROFILE%\WorkBuddy\xuexitong-script` → 启动。
+执行后自动完成：检查 Node → 多源下载源码（codeload / github / 镜像依次尝试）→ 安装到 `%USERPROFILE%\WorkBuddy\xuexitong-script` → 启动。
 
 **分享给别人时，只需发一个网址**：
 
@@ -24,6 +28,11 @@ https://github.com/qwe0305/xuexitong-script
 ```
 
 对方把网址丢给自己的 AI 助手，说"照这个装"，助手读 [`AGENT.md`](AGENT.md) 就能自己完成安装与验证。
+
+国内网络也可用 Gitee 镜像：
+```
+https://gitee.com/qwe0305/xuexitong-script
+```
 
 ---
 
