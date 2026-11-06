@@ -32,7 +32,7 @@ function flag(name) {
 const START_URL = arg('url', '');
 const AUTO = !START_URL;   // 没给 URL = 自动模式：打开门户，等用户点进课程后接管
 const PORTAL = 'https://mooc1.chaoxing.com/';
-const RATE = Number(arg('rate', '1.5'));
+const RATE = Number(arg('rate', '1.0'));   // 超星对非官方 UI 设置的倍速会强制暂停，默认 1.0
 const INTERVAL = Number(arg('interval', '3')) * 1000;
 const MAX_HOURS = Number(arg('max-hours', '10'));
 const NO_VIDEO_SKIP_MS = Number(arg('skip-after', '60')) * 1000;
@@ -96,7 +96,7 @@ function snapshotScript(rate) {
     if (v.paused && !v.ended) {
       try {
         v.muted = true;
-        v.playbackRate = ${rate};
+        if (${rate} !== 1 && Math.abs(v.playbackRate - ${rate}) > 0.01) v.playbackRate = ${rate};
         const p = v.play();
         if (p && p.catch) p.catch((err) => { out.playErr = String((err && err.name) || err); });
         out.acted.push('play');
@@ -108,8 +108,6 @@ function snapshotScript(rate) {
         const big = document.querySelector('.vjs-big-play-button, .prism-big-play-btn, .xgplayer-start, [class*="big-play"], [class*="poster-play"]');
         if (big) { try { big.click(); out.acted.push('click-big-play'); } catch (e) {} }
       }
-    } else if (Math.abs(v.playbackRate - ${rate}) > 0.01) {
-      try { v.playbackRate = ${rate}; } catch (e) {}
     }
   }
   out.url = location.href;
@@ -261,6 +259,13 @@ async function tick() {
     snap.hasVideo = false;
   }
   const now = Date.now();
+
+  // 可信鼠标抖动：降低超星"长时间无操作"判定
+  try {
+    const jx = 520 + ((now / 1000) % 40) * 4;
+    const jy = 260 + ((now / 3000) % 20) * 3;
+    await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(jx), y: Math.round(jy), button: 'none', clickCount: 0 });
+  } catch (e) {}
 
   // 当前标签页不是播放页时，扫一遍所有标签页，可能课程开在新标签
   if (!/studentstudy/.test(String(snap.url || ''))) {
