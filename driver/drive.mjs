@@ -50,6 +50,8 @@ const HEADLESS = !flag('windowed');   // 默认无窗口，加 --windowed 才显
 // AI 答题：默认关闭（先用 --quiz 显式开启）。刷课稳定性优先，答题按需再开。
 const NO_QUIZ = !flag('quiz');
 const AUTO_SUBMIT = flag('auto-submit'); // 答完自动交卷（默认不交，留给你核对）
+// 文字章节停留时长（默认 100 秒）。太短阅读任务点不计，太长纯浪费时间。
+const TEXT_DWELL = Number(arg('text-dwell', '100')) * 1000;
 
 const T0 = Date.now();
 let page = null;
@@ -68,6 +70,9 @@ let navFails = 0;          // 连续自动导航失败次数
 let lastQuizSig = '';      // 上次答过的题目签名，避免同一页反复作答
 let lastQuizAt = 0;
 let switchAttempts = 0;    // 连续切节失败次数（≥2 改用按钮兜底）
+let playerWaitSince = 0;   // 播放器 iframe 已挂载但视频未就绪的起始时间
+let textSince = 0;         // 文字章节开始阅读的时间
+let lastWaitLog = 0;
 
 /* ---------------- 页面内执行的快照+操作脚本 ---------------- */
 
@@ -97,6 +102,10 @@ function snapshotScript(rate) {
   // 2) 小节标题
   const act = document.querySelector('.posCatalog_select.active, .posCatalog_active');
   out.chapter = act ? (act.title || act.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60) : '';
+
+  // 2.1) 区分「视频章节但播放器还没加载」和「文字章节（本来就没视频）」
+  out.playerIframe = !!document.querySelector('iframe[src*="ananas"], iframe[src*="modules/video"], iframe[src*="modules/audio"]');
+  out.textIframe = !!document.querySelector('iframe[src*="knowledge/cards"], iframe[src*="knowledge"]');
 
   // 3) 视频
   const pick = (doc) => { try { return doc.querySelector('video#video_html5_api, video[id*="video_html5"], .vjs-tech, video'); } catch (e) { return null; } };
@@ -466,6 +475,45 @@ async function tick() {
     }
   }
 
+  /* ---- 无视频页的两种情形分开处理 ---- */
+  if (!snap.hasVideo && !snap.ended) {
+    /* ① 播放器 iframe 已经挂上、只是 video 元素还没出来（切节后常见）
+          → 这段时间不能算"无视频"，否则会把刚切过来的视频章节误跳 */
+    if (snap.playerIframe) {
+      if (!playerWaitSince) playerWaitSince = now;
+      if (now - playerWaitSince < 150000) {
+        noVideoSince = 0;
+        if (now - lastWaitLog > 20000) {
+          lastWaitLog = now;
+          log(`播放器已挂载但视频元素未就绪，等待中（${Math.round((now - playerWaitSince) / 1000)}s）`);
+        }
+        return;
+      }
+      log('播放器 iframe 等了 150s 仍无视频，按无视频处理');
+    } else {
+      playerWaitSince = 0;
+    }
+
+    /* ② 文字章节（知识卡片）：滚动阅读并停留足够时长，避免阅读任务点白读 */
+    if (snap.textIframe) {
+      if (!textSince) {
+        textSince = now;
+        log('文字章节，开始滚动阅读（停留 ' + Math.round(TEXT_DWELL / 1000) + 's 后切下一节）');
+      }
+      await scrollAllFrames();
+      // 注意：只有"还没读够"的时候才清零 noVideoSince。
+      // 之前这里无条件清零，导致读够之后 noVideoTooLong 永远不成立，卡在文字章节出不来。
+      if (now - textSince < TEXT_DWELL) {
+        noVideoSince = 0;
+        return;
+      }
+      // 读够了，交给下面的切节判定（textDone 会直接放行）
+    }
+  } else {
+    playerWaitSince = 0;
+    textSince = 0;
+  }
+
   // 决策：切下一节
   // 有些播放器停在最后一帧但 ended 始终为 false，因此「离结尾不足 1.5s」也视为播完。
   // 但这必须加两道门槛：① 时长要合理（切节瞬间 dur 会短暂变 0，实测见过 39:40 显示成 00:00）；
@@ -476,11 +524,16 @@ async function tick() {
   const nearEnd = isNearEnd && nearEndStreak >= 2;
 
   const endedLongEnough = snap.ended || nearEnd;
-  const noVideoTooLong = !snap.hasVideo && noVideoSince && now - noVideoSince > NO_VIDEO_SKIP_MS;
+  // 文字章节读完也算"该走了"
+  const textDone = !snap.hasVideo && snap.textIframe && textSince && (now - textSince) >= TEXT_DWELL;
+  const noVideoTooLong = (!snap.hasVideo && noVideoSince && now - noVideoSince > NO_VIDEO_SKIP_MS) || textDone;
 
   if (endedLongEnough || noVideoTooLong) {
     if (now - lastNextAt < 12000) return;
-    const reason = snap.ended ? '视频播完' : nearEnd ? '到达结尾' : `无视频 ${Math.round((now - noVideoSince) / 1000)}s`;
+    const reason = snap.ended ? '视频播完'
+      : nearEnd ? '到达结尾'
+      : textDone ? `文字章节已阅读 ${Math.round((now - textSince) / 1000)}s`
+      : `无视频 ${Math.round((now - noVideoSince) / 1000)}s`;
 
     // 目录节点点过一次不一定真跳成功，连续两次没换章节就改走「下一节按钮」
     const preferButton = switchAttempts >= 2;
@@ -497,6 +550,8 @@ async function tick() {
     lastCur = -1;
     stallSince = 0;
     stallKicked = false;
+    textSince = 0;
+    playerWaitSince = 0;
 
     const from = snap.chapter || '';
     log(`切换下一节（${reason}）→ ${r.ok ? (r.to || r.how || 'ok') : '失败：' + r.why}${preferButton ? ' [按钮兜底]' : ''}`);
@@ -527,6 +582,31 @@ function chapterScript() {
   const act = document.querySelector('.posCatalog_select.posCatalog_active, .posCatalog_active, .posCatalog_select.active');
   return { chapter: act ? (act.title || act.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60) : '' };
 })()`;
+}
+
+/**
+ * 文字章节「翻页式阅读」：把页面和知识卡片 iframe 都往下滚一点。
+ * 超星的阅读任务点通常按停留时长 + 是否有滚动来计，光打开不动容易被判未读。
+ */
+async function scrollAllFrames() {
+  const ROLL = `(() => {
+  const out = { y: -1, inner: [] };
+  try { window.scrollBy(0, 420); out.y = Math.round(window.scrollY); } catch (e) {}
+  // 同源的知识卡片 iframe 一起滚（跨域的情况交给 session 处理）
+  try {
+    for (const f of document.querySelectorAll('iframe[src*="knowledge"], iframe[src*="cards"]')) {
+      const d = f.contentDocument;
+      if (!d) continue;
+      const el = d.scrollingElement || d.documentElement;
+      if (el) { el.scrollTop = el.scrollTop + 420; out.inner.push(Math.round(el.scrollTop)); }
+    }
+  } catch (e) {}
+  return out;
+})()`;
+  try { await page.eval(ROLL); } catch (e) {}
+  for (const sid of Array.from(page.sessions.keys()).slice(0, 6)) {
+    try { await page.evalInSession(sid, ROLL); } catch (e) {}
+  }
 }
 
 function pageHint(url) {
