@@ -46,7 +46,9 @@
     function initializePlayer() {
         const app = {
             configs: {
-                playbackRate: 1.5,
+                // 实测（tests/rate-125.mjs）：任何非 1.0 倍速都会被 ananas 判为异常并锁死播放，
+                // 1.25x 实测推进 0s/27s 且被暂停 9 次。不要改大。
+                playbackRate: 1.0,
                 autoplay: true,
                 retryInterval: 2000,
                 maxRetries: 10,
@@ -640,7 +642,7 @@
             const a = window.app;
             if (a && a.configs && Number(a.configs.playbackRate) > 0) return Number(a.configs.playbackRate);
         } catch (e) {}
-        return 1.5;
+        return 1.0;
     }
 
     function hardPlay(video) {
@@ -736,7 +738,7 @@
     if (!app) return;
 
     const DEFAULTS = {
-        playbackRate: 1.5,
+        playbackRate: 1.0,          // 非 1.0 会被平台锁死播放，见 README「倍速与跳播的实测结论」
         autoSkipNoVideo: true,      // 无视频页面等不到就跳过
         skipNoVideoAfterMs: 60000,  // 等 60 秒仍无视频 → 跳过
         endedRetryAfterMs: 30000,   // 播完后 30 秒没跳节 → 重试
@@ -822,7 +824,7 @@
 
     function doPlay(video) {
         try {
-            if (video) video.playbackRate = Number(state.cfg.playbackRate) || 1.5;
+            if (video) video.playbackRate = Number(state.cfg.playbackRate) || 1.0;
         } catch (e) {}
         try {
             if (typeof app.play === 'function') { app.play(); return; }

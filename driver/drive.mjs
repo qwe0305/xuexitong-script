@@ -32,7 +32,14 @@ function flag(name) {
 const START_URL = arg('url', '');
 const AUTO = !START_URL;   // 没给 URL = 自动模式：打开门户，等用户点进课程后接管
 const PORTAL = 'https://mooc1.chaoxing.com/';
-const RATE = Number(arg('rate', '1.0'));   // 超星对非官方 UI 设置的倍速会强制暂停，默认 1.0
+/* 倍速：实测结论（tests/rate-125.mjs）——
+ * 1.0x 连续推进 15.1s/15s，0 次暂停；
+ * 1.25x 推进 0.0s/27s，被暂停 9 次，且播放器自行把 playbackRate 改回 1 仍不恢复。
+ * 结论：任何非 1.0 倍速都会被 ananas 播放器判定异常并锁死播放，因此这里强制 1.0。 */
+const RATE = 1.0;
+if (arg('rate', '') !== '' && Number(arg('rate')) !== 1) {
+  console.warn(`[warn] --rate ${arg('rate')} 已忽略：实测超星对非 1.0 倍速会强制暂停播放，强制使用 1.0x`);
+}
 const INTERVAL = Number(arg('interval', '3')) * 1000;
 const MAX_HOURS = Number(arg('max-hours', '10'));
 const NO_VIDEO_SKIP_MS = Number(arg('skip-after', '60')) * 1000;
@@ -45,6 +52,10 @@ let lastNextAt = 0;
 let noVideoSince = 0;
 let lastLog = 0;
 let lastHint = '';
+let lastCur = -1;          // 上次进度，用于停滞检测
+let stallSince = 0;        // 从什么时候开始不动
+let lastReloadAt = 0;      // 上次强制刷新时间
+let nearEndStreak = 0;     // 连续几轮判定为「临近结尾」
 
 /* ---------------- 页面内执行的快照+操作脚本 ---------------- */
 
@@ -73,7 +84,7 @@ function snapshotScript(rate) {
 
   // 2) 小节标题
   const act = document.querySelector('.posCatalog_select.active, .posCatalog_active');
-  out.chapter = act ? (act.title || act.innerText || '').trim().slice(0, 60) : '';
+  out.chapter = act ? (act.title || act.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60) : '';
 
   // 3) 视频
   const pick = (doc) => { try { return doc.querySelector('video#video_html5_api, video[id*="video_html5"], .vjs-tech, video'); } catch (e) { return null; } };
@@ -93,10 +104,13 @@ function snapshotScript(rate) {
     out.paused = v.paused;
     out.ended = v.ended;
     out.rate = v.playbackRate;
+    // 倍速守卫：任何非 1.0 倍速都会被播放器判为异常并锁死播放，强制拉回 1.0
+    if (Math.abs(v.playbackRate - 1) > 0.01) {
+      try { v.playbackRate = 1; out.acted.push('rate-guard:' + out.rate); } catch (e) {}
+    }
     if (v.paused && !v.ended) {
       try {
         v.muted = true;
-        if (${rate} !== 1 && Math.abs(v.playbackRate - ${rate}) > 0.01) v.playbackRate = ${rate};
         const p = v.play();
         if (p && p.catch) p.catch((err) => { out.playErr = String((err && err.name) || err); });
         out.acted.push('play');
@@ -118,14 +132,25 @@ function snapshotScript(rate) {
 
 function nextScript() {
   return `(() => {
+  // 实测（tests/catalog-probe.mjs）：超星用 class="posCatalog_select posCatalog_active" 标记当前小节，
+  // 不是 \`active\`。之前的 findIndex 恒为 -1，导致目录树切节一直没生效。
+  const isActive = (n) => {
+    const c = String(n.className || '');
+    if (/posCatalog_active|posCatalog_current/.test(c)) return true;
+    if (/(^|\\s)active(\\s|$)/.test(c)) return true;
+    const p = n.parentElement;
+    return !!(p && /(^|\\s)active(\\s|$)|posCatalog_active/.test(String(p.className || '')));
+  };
   const nodes = Array.from(document.querySelectorAll('.posCatalog_select:not(.firstLayer)'));
   if (nodes.length) {
-    let idx = nodes.findIndex((n) => n.classList.contains('active') ||
-      (n.parentElement && /active/.test(n.parentElement.className || '')));
+    let idx = nodes.findIndex(isActive);
     if (idx >= 0 && idx + 1 < nodes.length) {
       const target = nodes[idx + 1];
-      try { target.click(); } catch (e) {}
-      return { ok: true, how: 'tree', to: (target.title || target.innerText || '').trim().slice(0, 40) };
+      // 真正的跳转绑在 span.posCatalog_name 的 onclick="getTeacherAjax(courseId,clazzid,chapterId)"
+      const nameEl = target.querySelector('.posCatalog_name') || target;
+      const label = (nameEl.title || nameEl.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+      try { nameEl.click(); } catch (e) {}
+      return { ok: true, how: 'tree', from: idx, to: label };
     }
     if (idx === nodes.length - 1) return { ok: false, why: '已是最后一节' };
   }
@@ -309,6 +334,29 @@ async function tick() {
   if (snap.hasVideo) noVideoSince = 0;
   else if (!noVideoSince) noVideoSince = now;
 
+  /* 停滞检测：进度长时间不前进（暂停被反复压制 / 播放器假死）时，主动刷新一次页面 */
+  if (snap.hasVideo && !snap.ended) {
+    if (lastCur >= 0 && Math.abs((snap.cur ?? 0) - lastCur) < 0.5) {
+      if (!stallSince) stallSince = now;
+    } else {
+      stallSince = 0;
+    }
+    lastCur = snap.cur ?? -1;
+    if (stallSince && now - stallSince > 90000 && now - lastReloadAt > 300000) {
+      const stuckSec = Math.round((now - stallSince) / 1000);
+      lastReloadAt = now;
+      stallSince = 0;
+      lastCur = -1;
+      log(`进度停滞 ${stuckSec}s，强制刷新页面恢复`);
+      try { await page.eval('location.reload()'); } catch (e) {}
+      await sleep(6000);
+      return;
+    }
+  } else {
+    stallSince = 0;
+    lastCur = -1;
+  }
+
   if (now - lastLog > 8000) {
     lastLog = now;
     const prog = snap.hasVideo
@@ -318,12 +366,20 @@ async function tick() {
   }
 
   // 决策：切下一节
-  const endedLongEnough = snap.ended;
+  // 有些播放器停在最后一帧但 ended 始终为 false，因此「离结尾不足 1.5s」也视为播完。
+  // 但这必须加两道门槛：① 时长要合理（切节瞬间 dur 会短暂变 0，实测见过 39:40 显示成 00:00）；
+  // ② 要连续两轮都成立，避免播放器元数据抖动导致误切。
+  const saneDur = snap.hasVideo && (snap.dur ?? 0) > 60;
+  const isNearEnd = saneDur && (snap.cur ?? 0) >= (snap.dur ?? 0) - 1.5;
+  nearEndStreak = isNearEnd ? nearEndStreak + 1 : 0;
+  const nearEnd = isNearEnd && nearEndStreak >= 2;
+
+  const endedLongEnough = snap.ended || nearEnd;
   const noVideoTooLong = !snap.hasVideo && noVideoSince && now - noVideoSince > NO_VIDEO_SKIP_MS;
 
   if (endedLongEnough || noVideoTooLong) {
     if (now - lastNextAt < 12000) return;
-    const reason = endedLongEnough ? '视频播完' : `无视频 ${Math.round((now - noVideoSince) / 1000)}s`;
+    const reason = snap.ended ? '视频播完' : nearEnd ? '到达结尾' : `无视频 ${Math.round((now - noVideoSince) / 1000)}s`;
     let r;
     try {
       r = topCtxId != null ? await page.evalIn(topCtxId, nextScript()) : await page.eval(nextScript());
@@ -332,6 +388,9 @@ async function tick() {
     }
     lastNextAt = now;
     noVideoSince = 0;
+    nearEndStreak = 0;
+    lastCur = -1;
+    stallSince = 0;
     log(`切换下一节（${reason}）→ ${r.ok ? (r.to || r.how || 'ok') : '失败：' + r.why}`);
     if (r.ok) await sleep(3000);   // 等新页面加载
   }

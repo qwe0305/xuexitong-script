@@ -92,7 +92,8 @@ start.cmd
 ### 5. 后续使用
 
 - 想纯后台无窗口：先确认 `start.cmd` 那次登录过，之后双击 `start-headless.cmd`
-- 想调倍速：`start.cmd --rate 2`
+- **倍速不要调**：实测任何非 1.0 倍速都会被 ananas 播放器判为异常并锁死播放（1.25x 实测推进 0s/27s，被暂停 9 次），驱动已把 `--rate` 锁死在 1.0，传别的只会打印警告
+- **也不要试图跳到结尾**：超星会拦截 seek，把进度拽回原位（`seekable` 是完整的但设置 `currentTime` 无效）
 - 想看状态：`python agent/agent.py status`
 - 想让它自己判断并补动作：`python agent/agent.py watch`
 
@@ -113,7 +114,9 @@ start.cmd
 | 提示「没有检测到 Node.js」 | 未安装或没进 PATH | 装 Node 22 LTS，重开终端 |
 | `调试端口未就绪` | 9222 被占用 / 被安全软件拦 | 关掉其他调试浏览器；把该目录加白名单 |
 | 一直「等待进入课程页」 | 用户还没点进课程 | 提示用户点一下；确认登录成功 |
-| 视频一播就暂停 | ① 倍速被改成非 1.0（最常见）② 平台识别无头浏览器 | 先确认 `--rate` 是 1.0；仍暂停则改用 `start.cmd`（有窗口）并最小化 |
+| 视频一播就暂停 | ① 倍速不是 1.0（已被锁死，除非用户改了 config）② 平台识别无头浏览器 | 让用户改用 `start.cmd`（有窗口）并最小化；确认 `localStorage['xxt_config']` 里 `playbackRate` 是 1 |
+| 一直不切下一节 | 目录树的当前小节类名是 `posCatalog_active`（不是 `active`），且跳转绑在内层 `span.posCatalog_name` 的 onclick | 用 `node tests/switch-test.mjs` 复测；正常应输出「✅ 章节确实切换了」和变化后的 chapterId |
+| 进度原地不动 | 要么倍速非 1.0，要么 seek 被拦截后停在原位 | 用 `node tests/rate-125.mjs` 复测；把倍速改回 1.0 并重新 play() |
 | `连不上 CDP` | 浏览器被关掉 | 重新运行 start.cmd |
 | 卡在测验页不动 | 平台结构变化 | 让用户手动过；把页面截图给 Agent 调选择器 |
 

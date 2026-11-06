@@ -158,7 +158,7 @@ node driver/drive.mjs --url "<课程播放页URL>"
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `--windowed` | 关 | 改为有窗口运行（headless 被平台识别时用，可最小化） |
-| `--rate` | **1.0** | 倍速。**慎改**：超星 ananas 播放器会把非其 UI 设置的倍速判为异常并立刻暂停，1.5 大概率变成"点了播放又停" |
+| `--rate` | **1.0（已锁死）** | 无效参数。传非 1.0 只会打印警告并被忽略，原因见下节「倍速与跳播的实测结论」 |
 | `--interval` | 3 | 轮询间隔（秒） |
 | `--skip-after` | 60 | 无视频多少秒后跳过该节 |
 | `--max-hours` | 10 | 最长运行时长 |
@@ -182,7 +182,7 @@ python agent/agent.py watch         # 无人值守：每 20 秒自动决策并�
 python agent/agent.py watch --interval 30 --max-hours 6
 python agent/agent.py next          # 手动切下一节
 python agent/agent.py play          # 恢复播放
-python agent/agent.py rate 2        # 改倍速（持久化到 localStorage）
+python agent/agent.py rate 1        # 倍速只能是 1.0，改成别的会被平台锁死播放
 python agent/agent.py click 继续学习 # 按文字点按钮
 python agent/agent.py config '{"autoSkipNoVideo": false}'
 ```
@@ -193,7 +193,7 @@ python agent/agent.py config '{"autoSkipNoVideo": false}'
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `playbackRate` | 1.5 | 倍速 |
+| `playbackRate` | 1.0 | 倍速。**只能 1.0**，非 1.0 会被 ananas 判异常并锁死播放（见上文实测） |
 | `autoSkipNoVideo` | true | 无视频页面是否自动跳过 |
 | `skipNoVideoAfterMs` | 60000 | 等多久判定为无视频页 |
 | `endedRetryAfterMs` | 30000 | 播完后多久重试切节 |
@@ -230,16 +230,64 @@ agent/             本机中枢与 Agent
   agent.py         命令行 + 自动决策器
   config.example.json
 run.cmd            双击即跑（方案 B）
+tests/             可复现的验证脚本（都可直接 node 跑）
+  rate-125.mjs       倍速对照实验：1.0 → 1.25 → 1.0，输出实测倍率
+  seek-probe.mjs     可跳转范围 / 缓冲范围探测
+  catalog-probe.mjs  打印目录树节点及当前小节标记
+  catalog-dom.mjs    打印单个目录节点的完整结构与 onclick
+  switch-test.mjs    点下一节 → 点回来，验证切节是否真的生效
+  end-test.mjs       播完自动切节的端到端观察
+  frame-probe.mjs    跨域 iframe（OOPIF）穿透合成测试
+  diag-live.mjs      只读诊断：每个 frame 的视频状态
 docs/
   upstream-v3_optimized.js.txt   上游原始脚本存档
 ```
 
 ---
 
+## 倍速与跳播的实测结论（重要）
+
+这两件事在本项目里做过严格的对照实验，结论是**都不可行**，所以驱动直接把倍速锁死 1.0，不再提供加速开关。
+
+### 一、任何非 1.0 倍速都会被强制锁死播放
+
+实验脚本 `tests/rate-125.mjs`：同一节视频，依次 1.0x → 1.25x → 1.0x，每 3 秒采一次样。
+
+| 阶段 | 真实耗时 | 视频推进 | 暂停次数 | 实测倍率 |
+| --- | --- | --- | --- | --- |
+| A 基线 1.0x | 15s | 15.1s | 0 | **1.01x** |
+| B 测试 1.25x | 27s | **0.0s** | **9** | **0.00x** |
+| C 回退 1.0x | 15s | 15.1s | 0 | **1.01x** |
+
+更有意思的是 B 阶段里播放器自己把 `playbackRate` 改回了 `1`，但画面依旧不动 —— 说明它不是"改回倍速就恢复"，而是**检测到非官方倍速后直接锁死播放**，必须等倍速回到 1.0 再重新 `play()` 才解锁。1.5x 的实测结果同 1.25x（每 3~9 秒被暂停一次，进度原地打转）。
+
+另外试过"点播放器自己的倍速菜单"（`tests/try-menu-rate.mjs`、`try-menu2.mjs`）：`.vjs-playback-rate` 按钮确实存在，但它的 `.vjs-menu-content` 的 `innerHTML.length` 是 **0**，弹出菜单里只有字幕、线路、清晰度 —— **这门课根本没提供倍速选项**，这条路在未提供倍速的课程上走不通。
+
+### 二、不能跳着看，seek 会被拽回原位
+
+`tests/seek-probe.mjs` 显示 `seekable` 是完整的 `0–2380s`，缓冲里也出现了 `[2346.2, 2355.7]`（说明 seek 确实触发了分片加载），但把 `currentTime` 设成 2355 之后，3 秒时读到的进度仍然是被拦回的原位，随后从原位继续播。
+即：**超星主动拦截跳播**，不是 MSE 缓冲不足的技术限制。所以想"跳到结尾"来加速同样行不通，一节课必须按真实时长走完。
+
+### 三、切下一节：已修好并用真实点击验证
+
+`tests/switch-test.mjs` 做了"点下一节 → 立刻点回来"的往返验证：
+
+- 当前 `4.4 教学视频 1`，`chapterId=1261415881`
+- 点下一节后变成 `5.1 科学预言…`，`chapterId=1261415860` ✅
+- 再点回来，恢复 `4.4 教学视频 1` ✅
+
+过程中踩到两个 DOM 细节，已修进 `driver/drive.mjs`：
+
+1. 当前小节用的是 `class="posCatalog_select posCatalog_active"`，**不是** `active`。旧的 `findIndex` 恒等于 `-1`，导致"点目录树下一节"一直是失效的（只是碰巧有上一节/下一节按钮兜底）。
+2. 真正绑定跳转的不是 `.posCatalog_select` 这个 div，而是它里面的 `span.posCatalog_name`，其 `onclick="getTeacherAjax(courseId,clazzid,chapterId)"`。点 div 无效，点 span 才跳。
+
+---
+
 ## 已知限制
 
 - **方案 B 需要单独登录一次**：CDP 调试端口在 Chrome/Edge 136+ 不允许使用默认配置目录，因此用独立 profile，登录态不与你日常浏览器共享。
-- **倍速是最大的坑**：直接改 `video.playbackRate` 会被平台判定异常并反复暂停（实测 1.5x 必停，1.0x 稳定）。想加速请在播放器自己的倍速菜单里点，不要用脚本改属性。
+- **只能 1.0 倍速、只能实时**：见上一节的三组实验。想省时间只能靠"挂机"，靠不了"加速"。
+
 - **headless 被识别**：少数课程会检测无头浏览器特征（`navigator.webdriver` 等）。若视频播不动或立刻暂停，改用 `--windowed` 并把窗口最小化。
 - **扩展方案不能关窗口、不能让电脑睡眠**，否则播放与心跳一起断。标签页切后台、窗口最小化不影响。
 - 超星的播放器常在**跨域 iframe** 里（`mooc1` 与 `ananas` 等子域不同源）：
