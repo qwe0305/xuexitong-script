@@ -44,6 +44,7 @@ let page = null;
 let lastNextAt = 0;
 let noVideoSince = 0;
 let lastLog = 0;
+let lastHint = '';
 
 /* ---------------- 页面内执行的快照+操作脚本 ---------------- */
 
@@ -179,11 +180,15 @@ async function tick() {
   const snap = await page.eval(snapshotScript(RATE));
   const now = Date.now();
 
-  // 自动模式：还没进课程页就只等待，不误操作
-  if (!/\/mycourse\/studentstudy/.test(snap.url || '')) {
-    if (now - lastLog > 15000) {
+  // 自动模式：还没进播放页就只等待，并给出当前页面该点什么的提示
+  const curUrl = String(snap.url || '');
+  if (!/studentstudy/.test(curUrl)) {
+    const hint = pageHint(curUrl);
+    if (hint !== lastHint || now - lastLog > 15000) {
       lastLog = now;
-      log('等待进入课程页：请在弹出的窗口里点进课程（只需第一次），当前：' + String(snap.url || '').slice(0, 70));
+      lastHint = hint;
+      log('等待进入播放页 —— ' + hint);
+      log('   当前地址：' + curUrl.slice(0, 90));
     }
     return;
   }
@@ -229,6 +234,18 @@ async function tick() {
     log(`切换下一节（${reason}）→ ${r.ok ? (r.to || r.how || 'ok') : '失败：' + r.why}`);
     if (r.ok) await sleep(3000);   // 等新页面加载
   }
+}
+
+function pageHint(url) {
+  const u = String(url || '');
+  if (!u || u === 'about:blank') return '浏览器刚启动，等一下…';
+  if (/passport|\/login/i.test(u)) return '登录页：请先在这个窗口里登录学习通';
+  if (/i\.chaoxing\.com\/base|chaoxing\.com\/visit/i.test(u)) {
+    return '个人空间首页：点页面里的「课程」→ 选你的课 → 点「进入课程」，再点左侧目录第一节';
+  }
+  if (/studentstudy/.test(u)) return '已进入播放页';
+  if (/chaoxing\.com/.test(u)) return '还没到播放页：继续点「进入课程」→「章节」→ 任意一节';
+  return '当前不是学习通页面';
 }
 
 function fmt(x) {
