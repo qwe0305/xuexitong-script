@@ -153,6 +153,20 @@ node driver/drive.mjs --url "<课程播放页URL>"
 
 默认 headless：不弹窗、不占任务栏，脚本在后台把视频播完、自动切下一节。也可以双击 `run.cmd "<课程页URL>"`。
 
+#### 常驻与单实例
+
+- 驱动带**单实例锁**（`data/drive.pid`）：重复启动会自动检测到已在运行的实例并直接退出，避免"开机自启 + 手动双击"两个驱动互抢播放器。
+- 开机自启：把下面这段存成 `.vbs` 放进 `shell:startup`（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`），登录后自动隐藏启动。
+
+  ```vbs
+  Set sh = CreateObject("WScript.Shell")
+  sh.CurrentDirectory = "D:\WorkBuddy\chaoxing-agent"
+  sh.Run "cmd /c node driver\drive.mjs --interval 3 >> data\drive.out.log 2>&1", 0, False
+  ```
+
+  删除该 `.vbs` 即取消自启。
+- 日志在 `data/drive.out.log`，实时状态走本机中枢：`curl http://127.0.0.1:8731/status`。
+
 常用参数：
 
 | 参数 | 默认 | 说明 |

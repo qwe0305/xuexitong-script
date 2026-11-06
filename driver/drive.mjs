@@ -418,8 +418,37 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/* 单实例锁：防止「开机自启 + 手动双击」同时跑两个驱动互相抢播放器 */
+const LOCK = path.join(DATA_DIR, 'drive.pid');
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+function acquireLock() {
+  try {
+    if (fs.existsSync(LOCK)) {
+      const old = Number(String(fs.readFileSync(LOCK, 'utf8')).trim());
+      if (old && old !== process.pid && pidAlive(old)) {
+        console.log(`[driver] 已有驱动在运行（PID ${old}），本实例直接退出，避免两个驱动抢播放器`);
+        process.exit(0);
+      }
+    }
+    fs.writeFileSync(LOCK, String(process.pid));
+    const clean = () => {
+      try {
+        if (Number(String(fs.readFileSync(LOCK, 'utf8')).trim()) === process.pid) fs.unlinkSync(LOCK);
+      } catch (e) {}
+    };
+    process.on('exit', clean);
+    process.on('SIGINT', () => process.exit(0));
+    process.on('SIGTERM', () => process.exit(0));
+  } catch (e) {}
+}
+
 async function main() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  acquireLock();
 
   if (flag('status-only')) {
     const pages = await listPages(PORT).catch((e) => ({ error: e.message }));
