@@ -32,8 +32,26 @@ function flag(name) {
 }
 
 const START_URL = arg('url', '');
-const AUTO = !START_URL;   // 没给 URL = 自动模式：打开门户，等用户点进课程后接管
 const PORTAL = 'https://mooc1.chaoxing.com/';
+
+/* 记住上一次学习到的课程地址。
+ * 动机：进程崩溃/重启后冷启动时，驱动不知道自己该去哪，只能停在门户首页干等，
+ * 实测因此空等了 2 小时。把最后一次正常的 studentstudy 地址落到磁盘，下次直接回去。 */
+const LASTURL_FILE = process.env.XXT_DATA
+  ? path.join(process.env.XXT_DATA, 'last-url.txt')
+  : path.join(__dirname, '..', 'data', 'last-url.txt');
+
+function readSavedUrl() {
+  try {
+    const u = String(fs.readFileSync(LASTURL_FILE, 'utf8')).trim();
+    return /studentstudy/.test(u) ? u : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+const SAVED_URL = readSavedUrl();
+const AUTO = !START_URL;   // 没给 URL = 自动模式：优先用上次的课程地址，没有才去门户
 /* 倍速：实测结论（tests/rate-125.mjs）——
  * 1.0x 连续推进 15.1s/15s，0 次暂停；
  * 1.25x 推进 0.0s/27s，被暂停 9 次，且播放器自行把 playbackRate 改回 1 仍不恢复。
@@ -63,7 +81,9 @@ let lastCur = -1;          // 上次进度，用于停滞检测
 let stallSince = 0;        // 从什么时候开始不动
 let lastReloadAt = 0;      // 上次强制刷新时间
 let nearEndStreak = 0;     // 连续几轮判定为「临近结尾」
-let lastGoodUrl = '';      // 最后一次正常可用的课程页地址（掉线后回跳用）
+let lastGoodUrl = SAVED_URL;   // 最后一次正常可用的课程页地址（掉线后回跳用）
+let sessionNavTried = false; // 冷启动是否已尝试按上次地址回跳
+let brokenStreak = 0;        // 连续观察到异常页面的轮数
 let lastNavAt = 0;         // 上次自动导航时间
 let stallKicked = false;   // 本轮停滞是否已轻推过
 let navFails = 0;          // 连续自动导航失败次数
@@ -72,6 +92,7 @@ let lastQuizAt = 0;
 let switchAttempts = 0;    // 连续切节失败次数（≥2 改用按钮兜底）
 let playerWaitSince = 0;   // 播放器 iframe 已挂载但视频未就绪的起始时间
 let textSince = 0;         // 文字章节开始阅读的时间
+let textProbeAt = 0;       // 疑似文字章节的观察起始时间（防误判视频章节）
 let lastWaitLog = 0;
 let lastNetCheckAt = 0;    // 上次网络探测时间
 
@@ -229,10 +250,15 @@ async function ensureHub() {
   await sleep(1500);
 }
 
+/** 启动时该去的地址：命令行指定 > 上次学习地址 > 门户 */
+function entryUrl() {
+  return START_URL || SAVED_URL || PORTAL;
+}
+
 async function ensureBrowser() {
   if (await isCdpUp(PORT)) return;
   log('CDP 未就绪，自动拉起浏览器' + (HEADLESS ? '（无窗口后台）' : '（有窗口）'));
-  browserProc = await launchBrowser({ port: PORT, headless: HEADLESS, url: START_URL || PORTAL, keepAlive: true });
+  browserProc = await launchBrowser({ port: PORT, headless: HEADLESS, url: entryUrl(), keepAlive: true });
   log('浏览器已就绪');
 }
 
@@ -282,9 +308,21 @@ async function evalAllFrames(expr) {
 
 async function ensurePage() {
   if (page) return page;
-  page = await attach(START_URL || PORTAL, PORT);
+  page = await attach(entryUrl(), PORT);
   log('已连接页面');
   return page;
+}
+
+/**
+ * 把当前可用的课程地址记到磁盘，供下次冷启动直接回去。
+ */
+function saveUrl(u) {
+  try {
+    if (!u) return;
+    if (readSavedUrl() === u) return;
+    fs.mkdirSync(path.dirname(LASTURL_FILE), { recursive: true });
+    fs.writeFileSync(LASTURL_FILE, u);
+  } catch (e) {}
 }
 
 /**
@@ -359,18 +397,40 @@ async function tick() {
   if (!/studentstudy/.test(curUrl)) {
     /* 页面掉到错误页/空白页时（网络抖动、reload 失败等），之前这里只会无限等待。
        实测 17:33 一次网络抖动后页面变成 chrome-error://chromewebdata/，
-       驱动就此卡死 25 分钟。现在改成自动导航回最后一次正常的课程地址。 */
+       驱动就此卡死 25 分钟。现在改成自动导航回最后一次正常的课程地址。
+
+       但也要防"导航循环"：11-07 早上网络不通时，这里连续导航了 36 次
+       （每次都被弹回错误页），既没用又打扰站点。所以：
+       ① 连续两次观察到异常才动作（刚打开页面会短暂 about:blank，别误判）
+       ② 失败次数越多，重试间隔越长（指数退避，最长 5 分钟）
+       ③ 只要页面正常加载出任何内容，失败计数立刻清零 */
     const broken = !curUrl || curUrl === 'about:blank' || /^chrome-error:/.test(curUrl);
-    if (broken && now - lastNavAt > 30000) {
+    brokenStreak = broken ? brokenStreak + 1 : 0;
+    if (!broken) navFails = 0;
+
+    const navWait = Math.min(30000 * Math.max(navFails, 1), 300000);
+    if (broken && brokenStreak >= 2 && now - lastNavAt > navWait) {
       navFails++;
       // 回跳两三次还进不去（enc 过期等），就退到门户页重新走
       const target = navFails >= 3 ? PORTAL : (lastGoodUrl || PORTAL);
       lastNavAt = now;
-      log(`页面异常（${curUrl || '空白'}），自动导航回：${target.slice(0, 80)}${navFails >= 3 ? '（已失败 ' + navFails + ' 次，退回门户）' : ''}`);
+      brokenStreak = 0;
+      log(`页面异常（${curUrl || '空白'}），自动导航回：${target.slice(0, 80)}${navFails >= 3 ? '（已失败 ' + navFails + ' 次，退回门户，下次间隔 ' + Math.round(Math.min(30000 * navFails, 300000) / 1000) + 's）' : ''}`);
       try { await page.send('Page.navigate', { url: target }); } catch (e) {}
       await sleep(8000);
       return;
     }
+    /* 冷启动：停在门户/个人空间，但磁盘上记着上次学习的课程地址
+       → 直接回去，不用等人点。实测重启后曾因此在门户空等 2 小时。 */
+    if (!broken && SAVED_URL && !sessionNavTried && now - lastNavAt > 5000) {
+      sessionNavTried = true;
+      lastNavAt = now;
+      log('冷启动：按上次学习地址直接回到课程 ' + SAVED_URL.slice(0, 90));
+      try { await page.send('Page.navigate', { url: SAVED_URL }); } catch (e) {}
+      await sleep(9000);
+      return;
+    }
+
     const hint = pageHint(curUrl);
     if (hint !== lastHint || now - lastLog > 15000) {
       lastLog = now;
@@ -382,6 +442,7 @@ async function tick() {
   }
   lastGoodUrl = curUrl;   // 记下能正常用的课程地址，供掉线后回跳
   navFails = 0;
+  saveUrl(curUrl);        // 落盘，供下次冷启动
 
   const hb = {
     ts: new Date().toISOString(),
@@ -529,11 +590,21 @@ async function tick() {
       playerWaitSince = 0;
     }
 
-    /* ② 文字章节（知识卡片）：滚动阅读并停留足够时长，避免阅读任务点白读 */
+    /* ② 文字章节（知识卡片）：滚动阅读并停留足够时长，避免阅读任务点白读。
+       注意：视频章节刚加载时，播放器 iframe 可能还没建出来，这段时间看起来
+       跟文字章节一模一样（实测 8.4 就因此被误判成文字章节）。
+       所以先观察 15 秒，确认期间没有冒出播放器 iframe，才真正开始计时。 */
     if (snap.textIframe) {
+      if (!textProbeAt) {
+        textProbeAt = now;
+        log('页面像文字章节，先观察 15s 确认没有播放器再开始阅读');
+        return;
+      }
+      if (now - textProbeAt < 15000) return;
+
       if (!textSince) {
         textSince = now;
-        log('文字章节，开始滚动阅读（停留 ' + Math.round(TEXT_DWELL / 1000) + 's 后切下一节）');
+        log('确认为文字章节，开始滚动阅读（停留 ' + Math.round(TEXT_DWELL / 1000) + 's 后切下一节）');
       }
       await scrollAllFrames();
       // 注意：只有"还没读够"的时候才清零 noVideoSince。
@@ -547,6 +618,7 @@ async function tick() {
   } else {
     playerWaitSince = 0;
     textSince = 0;
+    textProbeAt = 0;
   }
 
   // 决策：切下一节
@@ -586,6 +658,7 @@ async function tick() {
     stallSince = 0;
     stallKicked = false;
     textSince = 0;
+    textProbeAt = 0;
     playerWaitSince = 0;
 
     const from = snap.chapter || '';
@@ -715,7 +788,8 @@ async function main() {
     process.exit(2);
   }
   if (START_URL) log('起始页面：' + START_URL.slice(0, 120));
-  else log('自动模式：会打开学习通门户，请你点进课程一次，之后自动接管');
+  else if (SAVED_URL) log('自动模式：从上次学习的地址继续 ' + SAVED_URL.slice(0, 90));
+  else log('自动模式：会打开学习通门户，请你点进课程一次，之后自动接管（之后会记住这个地址）');
 
   while (Date.now() - T0 < MAX_HOURS * 3600 * 1000) {
     try {
