@@ -121,7 +121,10 @@ start.cmd
 | 视频一播就暂停 | ① 倍速不是 1.0（已被锁死，除非用户改了 config）② 平台识别无头浏览器 | 让用户改用 `start.cmd`（有窗口）并最小化；确认 `localStorage['xxt_config']` 里 `playbackRate` 是 1 |
 | 一直不切下一节 | 目录树的当前小节类名是 `posCatalog_active`（不是 `active`），且跳转绑在内层 `span.posCatalog_name` 的 onclick | 用 `node tests/switch-test.mjs` 复测；正常应输出「✅ 章节确实切换了」和变化后的 chapterId |
 | 页面变成 `chrome-error://chromewebdata/` | 网络抖动或 reload 失败 | 已内置自动回跳（回最后一次正常的课程地址，连失败 3 次退回门户）。日志里会打印「页面异常…自动导航回」 |
-| 驱动莫名消失、日志停在某个时间点 | 进程崩了或跑满 `--max-hours` | 已提供守护 VBS（见 README「常驻与单实例」），退出 60 秒后自动拉起；`data/supervisor.log` 有重启记录 |
+| 驱动莫名消失、日志停在某个时间点 | 进程崩了（见过退出码 `0xC0000374` 堆损坏）或跑满 `--max-hours` | 用 `driver/supervisor.mjs` 托管：驱动退出 60s 后自动重启；退出码记在 `data/supervisor.log` |
+| 重启后卡在门户首页不动 | 冷启动不知道要去哪门课 | 现在会自动读 `data/last-url.txt` 回跳。文件缺失时手动带 `--url` 跑一次，之后就会记住 |
+| 日志反复出现「页面异常…自动导航回」 | 网络不通，页面被弹回错误页 | 属正常等待。新版做了指数退避（30s→最长 5 分钟）且连续两次异常才动作；网络恢复后自动继续 |
+| 视频章节被当成文字章节、读完就跳走 | 视频章节刚加载时播放器 iframe 还没建出来 | 已有 15 秒观察期，期间冒出播放器 iframe 就放弃文字章节判定 |
 | 进度原地不动 | 要么倍速非 1.0，要么 seek 被拦截后停在原位 | 用 `node tests/rate-125.mjs` 复测；把倍速改回 1.0 并重新 play() |
 | `连不上 CDP` | 浏览器被关掉 | 重新运行 start.cmd |
 | 卡在测验页不动 | 平台结构变化 | 让用户手动过；把页面截图给 Agent 调选择器 |

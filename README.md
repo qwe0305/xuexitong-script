@@ -158,10 +158,12 @@ node driver/drive.mjs --url "<课程播放页URL>"
 
 默认 headless：不弹窗、不占任务栏，脚本在后台把视频播完、自动切下一节。也可以双击 `run.cmd "<课程页URL>"`。
 
-#### 常驻与单实例
+#### 常驻、自愈与断点续跑
 
-- 驱动带**单实例锁**（`data/drive.pid`）：重复启动会自动检测到已在运行的实例并直接退出，避免"开机自启 + 手动双击"两个驱动互抢播放器。**注意不要手动删这个 pid 文件再启动**，否则锁会失效。
-- **崩溃自愈**：把下面这段存成 `.vbs` 放进 `shell:startup`（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`）。它是一个守护循环，驱动退出（崩溃或跑满 `--max-hours`）后 60 秒自动重新拉起。
+- **记住上次学到哪**：每次落到播放页就把地址写进 `data/last-url.txt`，冷启动时优先用它，不需要再手动点进课程。实测带 `enc` 的地址隔 16 小时仍有效。
+- **单实例锁**（`data/drive.pid`）：重复启动会检测到已在运行的实例并直接退出。**不要手动删这个 pid 文件再启动**，否则锁会失效（之前就因此跑出过两个驱动互抢播放器）。
+- **进程级守护** `driver/supervisor.mjs`：驱动退出（崩溃或跑满 `--max-hours`）后 60 秒自动重启，退出码记进 `data/supervisor.log`。
+- **开机自启**：把下面这段存成 `.vbs` 放进 `shell:startup`（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`），登录后自动隐藏启动守护进程：
 
   ```vbs
   Dim sh, fso, f
@@ -170,16 +172,16 @@ node driver/drive.mjs --url "<课程播放页URL>"
   sh.CurrentDirectory = "D:\WorkBuddy\chaoxing-agent"
   On Error Resume Next
   Do
-    sh.Run "cmd /c node driver\drive.mjs --interval 3 >> data\drive.out.log 2>&1", 0, True
+    sh.Run "cmd /c node driver\supervisor.mjs --interval 3 >> data\supervisor.out.log 2>&1", 0, True
     Set f = fso.OpenTextFile("data\supervisor.log", 8, True)
-    f.WriteLine Now & "  driver exited, restart in 60s"
+    f.WriteLine Now & "  supervisor exited, restart in 60s"
     f.Close
     WScript.Sleep 60000
   Loop
   ```
 
-  删除该 `.vbs` 即取消自启与自愈。
-- 日志：`data/drive.out.log`（驱动），`data/supervisor.log`（守护重启记录）。
+  删除该 `.vbs` 即取消自启。
+- 日志：`data/drive.out.log`（驱动）、`data/supervisor.log`（守护重启记录）。
 - 实时状态：`curl http://127.0.0.1:8731/status`。
 
 常用参数：
@@ -264,6 +266,7 @@ extension/         浏览器扩展（方案 A，直接加载这个目录）
 driver/            纯后台驱动（方案 B，不用插件）
   launch.mjs       拉起带调试端口的浏览器（登录用）
   drive.mjs        主循环：取快照 → 决策 → 点播放/切节
+  supervisor.mjs   进程守护：驱动退出后 60s 自动重启
   quiz.mjs         驱动版 AI 答题（默认关闭，加 --quiz 开启）
   cdp.mjs          极简 CDP 客户端（零依赖，用 Node 内置 WebSocket）
   browser.mjs      浏览器启动参数与端口探测
